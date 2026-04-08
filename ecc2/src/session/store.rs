@@ -13,6 +13,73 @@ pub struct StateStore {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DaemonActivity {
+    pub last_dispatch_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_dispatch_routed: usize,
+    pub last_dispatch_deferred: usize,
+    pub last_dispatch_leads: usize,
+    pub last_recovery_dispatch_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_recovery_dispatch_routed: usize,
+    pub last_recovery_dispatch_leads: usize,
+    pub last_rebalance_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_rebalance_rerouted: usize,
+    pub last_rebalance_leads: usize,
+}
+
+impl DaemonActivity {
+    pub fn prefers_rebalance_first(&self) -> bool {
+        if self.last_dispatch_deferred == 0 {
+            return false;
+        }
+
+        match (
+            self.last_dispatch_at.as_ref(),
+            self.last_recovery_dispatch_at.as_ref(),
+        ) {
+            (Some(dispatch_at), Some(recovery_at)) => recovery_at < dispatch_at,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    pub fn dispatch_cooloff_active(&self) -> bool {
+        self.prefers_rebalance_first() && self.last_dispatch_deferred >= 2
+    }
+
+    pub fn chronic_saturation_cleared_at(
+        &self,
+    ) -> Option<&chrono::DateTime<chrono::Utc>> {
+        if self.prefers_rebalance_first() {
+            return None;
+        }
+
+        match (
+            self.last_dispatch_at.as_ref(),
+            self.last_recovery_dispatch_at.as_ref(),
+        ) {
+            (Some(dispatch_at), Some(recovery_at)) if recovery_at > dispatch_at => Some(recovery_at),
+            _ => None,
+        }
+    }
+
+    pub fn stabilized_after_recovery_at(
+        &self,
+    ) -> Option<&chrono::DateTime<chrono::Utc>> {
+        if self.last_dispatch_deferred != 0 {
+            return None;
+        }
+
+        match (
+            self.last_dispatch_at.as_ref(),
+            self.last_recovery_dispatch_at.as_ref(),
+        ) {
+            (Some(dispatch_at), Some(recovery_at)) if dispatch_at > recovery_at => Some(dispatch_at),
+            _ => None,
+        }
+    }
+}
+
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -74,11 +141,27 @@ impl StateStore {
                 timestamp TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS daemon_activity (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                last_dispatch_at TEXT,
+                last_dispatch_routed INTEGER NOT NULL DEFAULT 0,
+                last_dispatch_deferred INTEGER NOT NULL DEFAULT 0,
+                last_dispatch_leads INTEGER NOT NULL DEFAULT 0,
+                last_recovery_dispatch_at TEXT,
+                last_recovery_dispatch_routed INTEGER NOT NULL DEFAULT 0,
+                last_recovery_dispatch_leads INTEGER NOT NULL DEFAULT 0,
+                last_rebalance_at TEXT,
+                last_rebalance_rerouted INTEGER NOT NULL DEFAULT 0,
+                last_rebalance_leads INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
             CREATE INDEX IF NOT EXISTS idx_tool_log_session ON tool_log(session_id);
             CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_session, read);
             CREATE INDEX IF NOT EXISTS idx_session_output_session
                 ON session_output(session_id, id);
+
+            INSERT OR IGNORE INTO daemon_activity (id) VALUES (1);
             ",
         )?;
         self.ensure_session_columns()?;
@@ -99,6 +182,42 @@ impl StateStore {
             self.conn
                 .execute("ALTER TABLE sessions ADD COLUMN pid INTEGER", [])
                 .context("Failed to add pid column to sessions table")?;
+        }
+
+        if !self.has_column("daemon_activity", "last_dispatch_deferred")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE daemon_activity ADD COLUMN last_dispatch_deferred INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("Failed to add last_dispatch_deferred column to daemon_activity table")?;
+        }
+
+        if !self.has_column("daemon_activity", "last_recovery_dispatch_at")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE daemon_activity ADD COLUMN last_recovery_dispatch_at TEXT",
+                    [],
+                )
+                .context("Failed to add last_recovery_dispatch_at column to daemon_activity table")?;
+        }
+
+        if !self.has_column("daemon_activity", "last_recovery_dispatch_routed")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE daemon_activity ADD COLUMN last_recovery_dispatch_routed INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("Failed to add last_recovery_dispatch_routed column to daemon_activity table")?;
+        }
+
+        if !self.has_column("daemon_activity", "last_recovery_dispatch_leads")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE daemon_activity ADD COLUMN last_recovery_dispatch_leads INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("Failed to add last_recovery_dispatch_leads column to daemon_activity table")?;
         }
 
         Ok(())
@@ -436,6 +555,19 @@ impl StateStore {
             .map_err(Into::into)
     }
 
+    pub fn unread_task_handoff_count(&self, session_id: &str) -> Result<usize> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM messages
+                 WHERE to_session = ?1 AND msg_type = 'task_handoff' AND read = 0",
+                rusqlite::params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as usize)
+            .map_err(Into::into)
+    }
+
     pub fn unread_task_handoff_targets(&self, limit: usize) -> Result<Vec<(String, usize)>> {
         let mut stmt = self.conn.prepare(
             "SELECT to_session, COUNT(*) as unread_count
@@ -486,6 +618,100 @@ impl StateStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn daemon_activity(&self) -> Result<DaemonActivity> {
+        self.conn
+            .query_row(
+                "SELECT last_dispatch_at, last_dispatch_routed, last_dispatch_deferred, last_dispatch_leads,
+                        last_recovery_dispatch_at, last_recovery_dispatch_routed, last_recovery_dispatch_leads,
+                        last_rebalance_at, last_rebalance_rerouted, last_rebalance_leads
+                 FROM daemon_activity
+                 WHERE id = 1",
+                [],
+                |row| {
+                    let parse_ts =
+                        |value: Option<String>| -> rusqlite::Result<Option<chrono::DateTime<chrono::Utc>>> {
+                            value
+                                .map(|raw| {
+                                    chrono::DateTime::parse_from_rfc3339(&raw)
+                                        .map(|ts| ts.with_timezone(&chrono::Utc))
+                                        .map_err(|err| {
+                                            rusqlite::Error::FromSqlConversionFailure(
+                                                0,
+                                                rusqlite::types::Type::Text,
+                                                Box::new(err),
+                                            )
+                                        })
+                                })
+                                .transpose()
+                        };
+
+                    Ok(DaemonActivity {
+                        last_dispatch_at: parse_ts(row.get(0)?)?,
+                        last_dispatch_routed: row.get::<_, i64>(1)? as usize,
+                        last_dispatch_deferred: row.get::<_, i64>(2)? as usize,
+                        last_dispatch_leads: row.get::<_, i64>(3)? as usize,
+                        last_recovery_dispatch_at: parse_ts(row.get(4)?)?,
+                        last_recovery_dispatch_routed: row.get::<_, i64>(5)? as usize,
+                        last_recovery_dispatch_leads: row.get::<_, i64>(6)? as usize,
+                        last_rebalance_at: parse_ts(row.get(7)?)?,
+                        last_rebalance_rerouted: row.get::<_, i64>(8)? as usize,
+                        last_rebalance_leads: row.get::<_, i64>(9)? as usize,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn record_daemon_dispatch_pass(
+        &self,
+        routed: usize,
+        deferred: usize,
+        leads: usize,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE daemon_activity
+             SET last_dispatch_at = ?1,
+                 last_dispatch_routed = ?2,
+                 last_dispatch_deferred = ?3,
+                 last_dispatch_leads = ?4
+             WHERE id = 1",
+            rusqlite::params![
+                chrono::Utc::now().to_rfc3339(),
+                routed as i64,
+                deferred as i64,
+                leads as i64
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn record_daemon_recovery_dispatch_pass(&self, routed: usize, leads: usize) -> Result<()> {
+        self.conn.execute(
+            "UPDATE daemon_activity
+             SET last_recovery_dispatch_at = ?1,
+                 last_recovery_dispatch_routed = ?2,
+                 last_recovery_dispatch_leads = ?3
+             WHERE id = 1",
+            rusqlite::params![chrono::Utc::now().to_rfc3339(), routed as i64, leads as i64],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn record_daemon_rebalance_pass(&self, rerouted: usize, leads: usize) -> Result<()> {
+        self.conn.execute(
+            "UPDATE daemon_activity
+             SET last_rebalance_at = ?1,
+                 last_rebalance_rerouted = ?2,
+                 last_rebalance_leads = ?3
+             WHERE id = 1",
+            rusqlite::params![chrono::Utc::now().to_rfc3339(), rerouted as i64, leads as i64],
+        )?;
+
+        Ok(())
     }
 
     pub fn delegated_children(&self, session_id: &str, limit: usize) -> Result<Vec<String>> {
@@ -854,5 +1080,85 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn daemon_activity_round_trips_latest_passes() -> Result<()> {
+        let tempdir = TestDir::new("store-daemon-activity")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+
+        db.record_daemon_dispatch_pass(4, 1, 2)?;
+        db.record_daemon_recovery_dispatch_pass(2, 1)?;
+        db.record_daemon_rebalance_pass(3, 1)?;
+
+        let activity = db.daemon_activity()?;
+        assert_eq!(activity.last_dispatch_routed, 4);
+        assert_eq!(activity.last_dispatch_deferred, 1);
+        assert_eq!(activity.last_dispatch_leads, 2);
+        assert_eq!(activity.last_recovery_dispatch_routed, 2);
+        assert_eq!(activity.last_recovery_dispatch_leads, 1);
+        assert_eq!(activity.last_rebalance_rerouted, 3);
+        assert_eq!(activity.last_rebalance_leads, 1);
+        assert!(activity.last_dispatch_at.is_some());
+        assert!(activity.last_recovery_dispatch_at.is_some());
+        assert!(activity.last_rebalance_at.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_activity_detects_rebalance_first_mode() {
+        let now = chrono::Utc::now();
+
+        let clear = DaemonActivity::default();
+        assert!(!clear.prefers_rebalance_first());
+        assert!(!clear.dispatch_cooloff_active());
+        assert!(clear.chronic_saturation_cleared_at().is_none());
+        assert!(clear.stabilized_after_recovery_at().is_none());
+
+        let unresolved = DaemonActivity {
+            last_dispatch_at: Some(now),
+            last_dispatch_routed: 0,
+            last_dispatch_deferred: 2,
+            last_dispatch_leads: 1,
+            last_recovery_dispatch_at: None,
+            last_recovery_dispatch_routed: 0,
+            last_recovery_dispatch_leads: 0,
+            last_rebalance_at: None,
+            last_rebalance_rerouted: 0,
+            last_rebalance_leads: 0,
+        };
+        assert!(unresolved.prefers_rebalance_first());
+        assert!(unresolved.dispatch_cooloff_active());
+        assert!(unresolved.chronic_saturation_cleared_at().is_none());
+        assert!(unresolved.stabilized_after_recovery_at().is_none());
+
+        let recovered = DaemonActivity {
+            last_recovery_dispatch_at: Some(now + chrono::Duration::seconds(1)),
+            last_recovery_dispatch_routed: 1,
+            ..unresolved
+        };
+        assert!(!recovered.prefers_rebalance_first());
+        assert!(!recovered.dispatch_cooloff_active());
+        assert_eq!(
+            recovered.chronic_saturation_cleared_at(),
+            recovered.last_recovery_dispatch_at.as_ref()
+        );
+        assert!(recovered.stabilized_after_recovery_at().is_none());
+
+        let stabilized = DaemonActivity {
+            last_dispatch_at: Some(now + chrono::Duration::seconds(2)),
+            last_dispatch_routed: 2,
+            last_dispatch_deferred: 0,
+            last_dispatch_leads: 1,
+            ..recovered
+        };
+        assert!(!stabilized.prefers_rebalance_first());
+        assert!(!stabilized.dispatch_cooloff_active());
+        assert!(stabilized.chronic_saturation_cleared_at().is_none());
+        assert_eq!(
+            stabilized.stabilized_after_recovery_at(),
+            stabilized.last_dispatch_at.as_ref()
+        );
     }
 }

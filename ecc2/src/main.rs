@@ -90,6 +90,30 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         lead_limit: usize,
     },
+    /// Dispatch unread handoffs, then rebalance delegate backlog across lead teams
+    CoordinateBacklog {
+        /// Agent type for routed delegates
+        #[arg(short, long, default_value = "claude")]
+        agent: String,
+        /// Create a dedicated worktree if new delegates must be spawned
+        #[arg(short, long, default_value_t = true)]
+        worktree: bool,
+        /// Maximum lead sessions to sweep in one pass
+        #[arg(long, default_value_t = 10)]
+        lead_limit: usize,
+    },
+    /// Rebalance unread handoffs across lead teams with backed-up delegates
+    RebalanceAll {
+        /// Agent type for routed delegates
+        #[arg(short, long, default_value = "claude")]
+        agent: String,
+        /// Create a dedicated worktree if new delegates must be spawned
+        #[arg(short, long, default_value_t = true)]
+        worktree: bool,
+        /// Maximum lead sessions to sweep in one pass
+        #[arg(long, default_value_t = 10)]
+        lead_limit: usize,
+    },
     /// Rebalance unread handoffs off backed-up delegates onto clearer team capacity
     RebalanceTeam {
         /// Lead session ID or alias
@@ -255,16 +279,25 @@ async fn main() -> Result<()> {
                 use_worktree,
             )
             .await?;
-            println!(
-                "Assignment routed: {} -> {} ({})",
-                short_session(&lead_id),
-                short_session(&outcome.session_id),
-                match outcome.action {
-                    session::manager::AssignmentAction::Spawned => "spawned",
-                    session::manager::AssignmentAction::ReusedIdle => "reused-idle",
-                    session::manager::AssignmentAction::ReusedActive => "reused-active",
-                }
-            );
+            if session::manager::assignment_action_routes_work(outcome.action) {
+                println!(
+                    "Assignment routed: {} -> {} ({})",
+                    short_session(&lead_id),
+                    short_session(&outcome.session_id),
+                    match outcome.action {
+                        session::manager::AssignmentAction::Spawned => "spawned",
+                        session::manager::AssignmentAction::ReusedIdle => "reused-idle",
+                        session::manager::AssignmentAction::ReusedActive => "reused-active",
+                        session::manager::AssignmentAction::DeferredSaturated => unreachable!(),
+                    }
+                );
+            } else {
+                println!(
+                    "Assignment deferred: {} is saturated; task stayed in {} inbox",
+                    short_session(&lead_id),
+                    short_session(&lead_id),
+                );
+            }
         }
         Some(Commands::DrainInbox {
             session_id,
@@ -285,10 +318,18 @@ async fn main() -> Result<()> {
             if outcomes.is_empty() {
                 println!("No unread task handoffs for {}", short_session(&lead_id));
             } else {
+                let routed_count = outcomes
+                    .iter()
+                    .filter(|outcome| session::manager::assignment_action_routes_work(outcome.action))
+                    .count();
+                let deferred_count = outcomes.len().saturating_sub(routed_count);
                 println!(
-                    "Routed {} inbox task handoff(s) from {}",
+                    "Processed {} inbox task handoff(s) from {} ({} routed, {} deferred)",
                     outcomes.len(),
                     short_session(&lead_id)
+                    ,
+                    routed_count,
+                    deferred_count
                 );
                 for outcome in outcomes {
                     println!(
@@ -299,6 +340,9 @@ async fn main() -> Result<()> {
                             session::manager::AssignmentAction::Spawned => "spawned",
                             session::manager::AssignmentAction::ReusedIdle => "reused-idle",
                             session::manager::AssignmentAction::ReusedActive => "reused-active",
+                            session::manager::AssignmentAction::DeferredSaturated => {
+                                "deferred-saturated"
+                            }
                         },
                         outcome.task
                     );
@@ -321,18 +365,127 @@ async fn main() -> Result<()> {
             if outcomes.is_empty() {
                 println!("No unread task handoff backlog found");
             } else {
-                let total_routed: usize = outcomes.iter().map(|outcome| outcome.routed.len()).sum();
+                let total_processed: usize = outcomes.iter().map(|outcome| outcome.routed.len()).sum();
+                let total_routed: usize = outcomes
+                    .iter()
+                    .map(|outcome| {
+                        outcome
+                            .routed
+                            .iter()
+                            .filter(|item| session::manager::assignment_action_routes_work(item.action))
+                            .count()
+                    })
+                    .sum();
+                let total_deferred = total_processed.saturating_sub(total_routed);
                 println!(
-                    "Auto-dispatched {} task handoff(s) across {} lead session(s)",
+                    "Auto-dispatch processed {} task handoff(s) across {} lead session(s) ({} routed, {} deferred)",
+                    total_processed,
+                    outcomes.len(),
                     total_routed,
+                    total_deferred
+                );
+                for outcome in outcomes {
+                    let routed = outcome
+                        .routed
+                        .iter()
+                        .filter(|item| session::manager::assignment_action_routes_work(item.action))
+                        .count();
+                    let deferred = outcome.routed.len().saturating_sub(routed);
+                    println!(
+                        "- {} | unread {} | routed {} | deferred {}",
+                        short_session(&outcome.lead_session_id),
+                        outcome.unread_count,
+                        routed,
+                        deferred
+                    );
+                }
+            }
+        }
+        Some(Commands::CoordinateBacklog {
+            agent,
+            worktree: use_worktree,
+            lead_limit,
+        }) => {
+            let outcome = session::manager::coordinate_backlog(
+                &db,
+                &cfg,
+                &agent,
+                use_worktree,
+                lead_limit,
+            )
+            .await?;
+            let total_processed: usize = outcome
+                .dispatched
+                .iter()
+                .map(|dispatch| dispatch.routed.len())
+                .sum();
+            let total_routed: usize = outcome
+                .dispatched
+                .iter()
+                .map(|dispatch| {
+                    dispatch
+                        .routed
+                        .iter()
+                        .filter(|item| session::manager::assignment_action_routes_work(item.action))
+                        .count()
+                })
+                .sum();
+            let total_deferred = total_processed.saturating_sub(total_routed);
+            let total_rerouted: usize = outcome
+                .rebalanced
+                .iter()
+                .map(|rebalance| rebalance.rerouted.len())
+                .sum();
+
+            if total_routed == 0
+                && total_rerouted == 0
+                && outcome.remaining_backlog_sessions == 0
+            {
+                println!("Backlog already clear");
+            } else {
+                println!(
+                    "Coordinated backlog: processed {} handoff(s) across {} lead(s) ({} routed, {} deferred); rebalanced {} handoff(s) across {} lead(s); remaining {} handoff(s) across {} session(s) [{} absorbable, {} saturated]",
+                    total_processed,
+                    outcome.dispatched.len(),
+                    total_routed,
+                    total_deferred,
+                    total_rerouted,
+                    outcome.rebalanced.len(),
+                    outcome.remaining_backlog_messages,
+                    outcome.remaining_backlog_sessions,
+                    outcome.remaining_absorbable_sessions,
+                    outcome.remaining_saturated_sessions
+                );
+            }
+        }
+        Some(Commands::RebalanceAll {
+            agent,
+            worktree: use_worktree,
+            lead_limit,
+        }) => {
+            let outcomes = session::manager::rebalance_all_teams(
+                &db,
+                &cfg,
+                &agent,
+                use_worktree,
+                lead_limit,
+            )
+            .await?;
+            if outcomes.is_empty() {
+                println!("No delegate backlog needed global rebalancing");
+            } else {
+                let total_rerouted: usize =
+                    outcomes.iter().map(|outcome| outcome.rerouted.len()).sum();
+                println!(
+                    "Rebalanced {} task handoff(s) across {} lead session(s)",
+                    total_rerouted,
                     outcomes.len()
                 );
                 for outcome in outcomes {
                     println!(
-                        "- {} | unread {} | routed {}",
+                        "- {} | rerouted {}",
                         short_session(&outcome.lead_session_id),
-                        outcome.unread_count,
-                        outcome.routed.len()
+                        outcome.rerouted.len()
                     );
                 }
             }
@@ -371,6 +524,9 @@ async fn main() -> Result<()> {
                             session::manager::AssignmentAction::Spawned => "spawned",
                             session::manager::AssignmentAction::ReusedIdle => "reused-idle",
                             session::manager::AssignmentAction::ReusedActive => "reused-active",
+                            session::manager::AssignmentAction::DeferredSaturated => {
+                                "deferred-saturated"
+                            }
                         },
                         outcome.task
                     );
@@ -744,6 +900,56 @@ mod tests {
                 assert_eq!(lead_limit, 4);
             }
             _ => panic!("expected auto-dispatch subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_coordinate_backlog_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "coordinate-backlog",
+            "--agent",
+            "claude",
+            "--lead-limit",
+            "7",
+        ])
+        .expect("coordinate-backlog should parse");
+
+        match cli.command {
+            Some(Commands::CoordinateBacklog {
+                agent,
+                lead_limit,
+                ..
+            }) => {
+                assert_eq!(agent, "claude");
+                assert_eq!(lead_limit, 7);
+            }
+            _ => panic!("expected coordinate-backlog subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_rebalance_all_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "rebalance-all",
+            "--agent",
+            "claude",
+            "--lead-limit",
+            "6",
+        ])
+        .expect("rebalance-all should parse");
+
+        match cli.command {
+            Some(Commands::RebalanceAll {
+                agent,
+                lead_limit,
+                ..
+            }) => {
+                assert_eq!(agent, "claude");
+                assert_eq!(lead_limit, 6);
+            }
+            _ => panic!("expected rebalance-all subcommand"),
         }
     }
 
