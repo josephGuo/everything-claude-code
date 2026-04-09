@@ -1,28 +1,31 @@
+use chrono::{Duration, Utc};
+use crossterm::event::KeyEvent;
 use ratatui::{
     prelude::*,
     widgets::{
         Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs, Wrap,
     },
 };
-use std::collections::HashMap;
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
+use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
 
 use super::widgets::{budget_state, format_currency, format_token_count, BudgetState, TokenMeter};
 use crate::comms;
-use crate::config::{Config, PaneLayout};
+use crate::config::{Config, PaneLayout, PaneNavigationAction, Theme};
 use crate::observability::ToolLogEntry;
 use crate::session::manager;
-use crate::session::output::{OutputEvent, OutputLine, SessionOutputStore, OUTPUT_BUFFER_LIMIT};
+use crate::session::output::{
+    OutputEvent, OutputLine, OutputStream, SessionOutputStore, OUTPUT_BUFFER_LIMIT,
+};
 use crate::session::store::{DaemonActivity, StateStore};
 use crate::session::{Session, SessionMessage, SessionState};
 use crate::worktree;
 
 #[cfg(test)]
-use crate::session::output::OutputStream;
-#[cfg(test)]
 use crate::session::{SessionMetrics, WorktreeInfo};
 
-const DEFAULT_PANE_SIZE_PERCENT: u16 = 35;
 const DEFAULT_GRID_SIZE_PERCENT: u16 = 50;
 const OUTPUT_PANE_PERCENT: u16 = 70;
 const MIN_PANE_SIZE_PERCENT: u16 = 20;
@@ -38,6 +41,14 @@ struct WorktreeDiffColumns {
     additions: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ThemePalette {
+    accent: Color,
+    row_highlight_bg: Color,
+    muted: Color,
+    help_border: Color,
+}
+
 pub struct Dashboard {
     db: StateStore,
     cfg: Config,
@@ -46,6 +57,8 @@ pub struct Dashboard {
     sessions: Vec<Session>,
     session_output_cache: HashMap<String, Vec<OutputLine>>,
     unread_message_counts: HashMap<String, usize>,
+    approval_queue_counts: HashMap<String, usize>,
+    approval_queue_preview: Vec<SessionMessage>,
     handoff_backlog_counts: HashMap<String, usize>,
     worktree_health_by_session: HashMap<String, worktree::WorktreeHealth>,
     global_handoff_backlog_leads: usize,
@@ -54,6 +67,7 @@ pub struct Dashboard {
     selected_messages: Vec<SessionMessage>,
     selected_parent_session: Option<String>,
     selected_child_sessions: Vec<DelegatedChildSummary>,
+    focused_delegate_session_id: Option<String>,
     selected_team_summary: Option<TeamSummary>,
     selected_route_preview: Option<String>,
     logs: Vec<ToolLogEntry>,
@@ -63,15 +77,32 @@ pub struct Dashboard {
     selected_conflict_protocol: Option<String>,
     selected_merge_readiness: Option<worktree::MergeReadiness>,
     output_mode: OutputMode,
+    output_filter: OutputFilter,
+    output_time_filter: OutputTimeFilter,
+    timeline_event_filter: TimelineEventFilter,
+    timeline_scope: SearchScope,
     selected_pane: Pane,
     selected_session: usize,
     show_help: bool,
     operator_note: Option<String>,
+    pane_command_mode: bool,
     output_follow: bool,
     output_scroll_offset: usize,
     last_output_height: usize,
+    metrics_scroll_offset: usize,
+    last_metrics_height: usize,
     pane_size_percent: u16,
+    collapsed_panes: HashSet<Pane>,
+    search_input: Option<String>,
+    spawn_input: Option<String>,
+    search_query: Option<String>,
+    search_scope: SearchScope,
+    search_agent_filter: SearchAgentFilter,
+    search_matches: Vec<SearchMatch>,
+    selected_search_match: usize,
     session_table_state: TableState,
+    last_cost_metrics_signature: Option<(u64, u128)>,
+    last_budget_alert_state: BudgetState,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -89,7 +120,7 @@ struct SessionSummary {
     in_progress_worktrees: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Pane {
     Sessions,
     Output,
@@ -100,16 +131,108 @@ enum Pane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
     SessionOutput,
+    Timeline,
     WorktreeDiff,
     ConflictProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFilter {
+    All,
+    ErrorsOnly,
+    ToolCallsOnly,
+    FileChangesOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputTimeFilter {
+    AllTime,
+    Last15Minutes,
+    LastHour,
+    Last24Hours,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineEventFilter {
+    All,
+    Lifecycle,
+    Messages,
+    ToolCalls,
+    FileChanges,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchScope {
+    SelectedSession,
+    AllSessions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchAgentFilter {
+    AllAgents,
+    SelectedAgentType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchMatch {
+    session_id: String,
+    line_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineEventType {
+    Lifecycle,
+    Message,
+    ToolCall,
+    FileChange,
+}
+
+#[derive(Debug, Clone)]
+struct TimelineEvent {
+    occurred_at: chrono::DateTime<Utc>,
+    session_id: String,
+    event_type: TimelineEventType,
+    summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnRequest {
+    requested_count: usize,
+    task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnPlan {
+    requested_count: usize,
+    spawn_count: usize,
+    task: String,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PaneAreas {
     sessions: Rect,
-    output: Rect,
-    metrics: Rect,
+    output: Option<Rect>,
+    metrics: Option<Rect>,
     log: Option<Rect>,
+}
+
+impl PaneAreas {
+    fn assign(&mut self, pane: Pane, area: Rect) {
+        match pane {
+            Pane::Sessions => self.sessions = area,
+            Pane::Output => self.output = Some(area),
+            Pane::Metrics => self.metrics = Some(area),
+            Pane::Log => self.log = Some(area),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +248,15 @@ struct AggregateUsage {
 struct DelegatedChildSummary {
     session_id: String,
     state: SessionState,
+    worktree_health: Option<worktree::WorktreeHealth>,
+    approval_backlog: usize,
     handoff_backlog: usize,
+    tokens_used: u64,
+    files_changed: u32,
+    duration_secs: u64,
+    task_preview: String,
+    branch: Option<String>,
+    last_output_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -148,10 +279,12 @@ impl Dashboard {
         cfg: Config,
         output_store: SessionOutputStore,
     ) -> Self {
-        let pane_size_percent = match cfg.pane_layout {
-            PaneLayout::Grid => DEFAULT_GRID_SIZE_PERCENT,
-            PaneLayout::Horizontal | PaneLayout::Vertical => DEFAULT_PANE_SIZE_PERCENT,
-        };
+        let pane_size_percent = configured_pane_size(&cfg, cfg.pane_layout);
+        let initial_cost_metrics_signature = cost_metrics_signature(&cfg.cost_metrics_path());
+        let _ = db.refresh_session_durations();
+        if initial_cost_metrics_signature.is_some() {
+            let _ = db.sync_cost_tracker_metrics(&cfg.cost_metrics_path());
+        }
         let sessions = db.list_sessions().unwrap_or_default();
         let output_rx = output_store.subscribe();
         let mut session_table_state = TableState::default();
@@ -167,6 +300,8 @@ impl Dashboard {
             sessions,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
+            approval_queue_counts: HashMap::new(),
+            approval_queue_preview: Vec::new(),
             handoff_backlog_counts: HashMap::new(),
             worktree_health_by_session: HashMap::new(),
             global_handoff_backlog_leads: 0,
@@ -175,6 +310,7 @@ impl Dashboard {
             selected_messages: Vec::new(),
             selected_parent_session: None,
             selected_child_sessions: Vec::new(),
+            focused_delegate_session_id: None,
             selected_team_summary: None,
             selected_route_preview: None,
             logs: Vec::new(),
@@ -184,15 +320,32 @@ impl Dashboard {
             selected_conflict_protocol: None,
             selected_merge_readiness: None,
             output_mode: OutputMode::SessionOutput,
+            output_filter: OutputFilter::All,
+            output_time_filter: OutputTimeFilter::AllTime,
+            timeline_event_filter: TimelineEventFilter::All,
+            timeline_scope: SearchScope::SelectedSession,
             selected_pane: Pane::Sessions,
             selected_session: 0,
             show_help: false,
             operator_note: None,
+            pane_command_mode: false,
             output_follow: true,
             output_scroll_offset: 0,
             last_output_height: 0,
+            metrics_scroll_offset: 0,
+            last_metrics_height: 0,
             pane_size_percent,
+            collapsed_panes: HashSet::new(),
+            search_input: None,
+            spawn_input: None,
+            search_query: None,
+            search_scope: SearchScope::SelectedSession,
+            search_agent_filter: SearchAgentFilter::AllAgents,
+            search_matches: Vec::new(),
+            selected_search_match: 0,
             session_table_state,
+            last_cost_metrics_signature: initial_cost_metrics_signature,
+            last_budget_alert_state: BudgetState::Normal,
         };
         dashboard.unread_message_counts = dashboard.db.unread_message_counts().unwrap_or_default();
         dashboard.sync_handoff_backlog_counts();
@@ -202,6 +355,7 @@ impl Dashboard {
         dashboard.sync_selected_messages();
         dashboard.sync_selected_lineage();
         dashboard.refresh_logs();
+        dashboard.last_budget_alert_state = dashboard.aggregate_usage().overall_state;
         dashboard
     }
 
@@ -222,8 +376,12 @@ impl Dashboard {
         } else {
             let pane_areas = self.pane_areas(chunks[1]);
             self.render_sessions(frame, pane_areas.sessions);
-            self.render_output(frame, pane_areas.output);
-            self.render_metrics(frame, pane_areas.metrics);
+            if let Some(output_area) = pane_areas.output {
+                self.render_output(frame, output_area);
+            }
+            if let Some(metrics_area) = pane_areas.metrics {
+                self.render_metrics(frame, metrics_area);
+            }
 
             if let Some(log_area) = pane_areas.log {
                 self.render_log(frame, log_area);
@@ -240,11 +398,13 @@ impl Dashboard {
             .filter(|session| session.state == SessionState::Running)
             .count();
         let total = self.sessions.len();
+        let palette = self.theme_palette();
 
         let title = format!(
-            " ECC 2.0 | {running} running / {total} total | {} {}% ",
+            " ECC 2.0 | {running} running / {total} total | {} {}% | {} ",
             self.layout_label(),
-            self.pane_size_percent
+            self.pane_size_percent,
+            self.theme_label()
         );
         let tabs = Tabs::new(
             self.visible_panes()
@@ -256,7 +416,7 @@ impl Dashboard {
         .select(self.selected_pane_index())
         .highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette.accent)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -285,22 +445,31 @@ impl Dashboard {
             &self.worktree_health_by_session,
             stabilized,
         );
+        let mut overview_lines = vec![
+            summary_line(&summary),
+            attention_queue_line(&summary, stabilized),
+            approval_queue_line(&self.approval_queue_counts),
+        ];
+        if let Some(preview) = approval_queue_preview_line(&self.approval_queue_preview) {
+            overview_lines.push(preview);
+        }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(3)])
+            .constraints([
+                Constraint::Length(overview_lines.len() as u16),
+                Constraint::Min(3),
+            ])
             .split(inner_area);
 
-        frame.render_widget(
-            Paragraph::new(vec![
-                summary_line(&summary),
-                attention_queue_line(&summary, stabilized),
-            ]),
-            chunks[0],
-        );
+        frame.render_widget(Paragraph::new(overview_lines), chunks[0]);
 
         let rows = self.sessions.iter().map(|session| {
             session_row(
                 session,
+                self.approval_queue_counts
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(0),
                 self.handoff_backlog_counts
                     .get(&session.id)
                     .copied()
@@ -308,7 +477,16 @@ impl Dashboard {
             )
         });
         let header = Row::new([
-            "ID", "Agent", "State", "Branch", "Backlog", "Tokens", "Duration",
+            "ID",
+            "Agent",
+            "State",
+            "Branch",
+            "Approvals",
+            "Backlog",
+            "Tokens",
+            "Tools",
+            "Files",
+            "Duration",
         ])
         .style(Style::default().add_modifier(Modifier::BOLD));
         let widths = [
@@ -316,8 +494,11 @@ impl Dashboard {
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Min(12),
+            Constraint::Length(10),
             Constraint::Length(7),
             Constraint::Length(8),
+            Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Length(8),
         ];
 
@@ -328,7 +509,7 @@ impl Dashboard {
             .highlight_spacing(HighlightSpacing::Always)
             .row_highlight_style(
                 Style::default()
-                    .bg(Color::DarkGray)
+                    .bg(self.theme_palette().row_highlight_bg)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -358,17 +539,29 @@ impl Dashboard {
         let (title, content) = if self.sessions.get(self.selected_session).is_some() {
             match self.output_mode {
                 OutputMode::SessionOutput => {
-                    let lines = self.selected_output_lines();
+                    let lines = self.visible_output_lines();
                     let content = if lines.is_empty() {
-                        "Waiting for session output...".to_string()
+                        Text::from(self.empty_output_message())
+                    } else if self.search_query.is_some() {
+                        self.render_searchable_output(&lines)
                     } else {
-                        lines
-                            .iter()
-                            .map(|line| line.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                        Text::from(
+                            lines
+                                .iter()
+                                .map(|line| Line::from(line.text.clone()))
+                                .collect::<Vec<_>>(),
+                        )
                     };
-                    (" Output ", content)
+                    (self.output_title(), content)
+                }
+                OutputMode::Timeline => {
+                    let lines = self.visible_timeline_lines();
+                    let content = if lines.is_empty() {
+                        Text::from(self.empty_timeline_message())
+                    } else {
+                        Text::from(lines)
+                    };
+                    (self.output_title(), content)
                 }
                 OutputMode::WorktreeDiff => {
                     let content = self
@@ -384,19 +577,19 @@ impl Dashboard {
                         .unwrap_or_else(|| {
                             "No worktree diff available for the selected session.".to_string()
                         });
-                    (" Diff ", content)
+                    (" Diff ".to_string(), Text::from(content))
                 }
                 OutputMode::ConflictProtocol => {
                     let content = self.selected_conflict_protocol.clone().unwrap_or_else(|| {
                         "No conflicted worktree available for the selected session.".to_string()
                     });
-                    (" Conflict Protocol ", content)
+                    (" Conflict Protocol ".to_string(), Text::from(content))
                 }
             }
         } else {
             (
-                " Output ",
-                "No sessions. Press 'n' to start one.".to_string(),
+                self.output_title(),
+                Text::from("No sessions. Press 'n' to start one."),
             )
         };
 
@@ -445,7 +638,182 @@ impl Dashboard {
         frame.render_widget(additions, column_chunks[1]);
     }
 
-    fn render_metrics(&self, frame: &mut Frame, area: Rect) {
+    fn output_title(&self) -> String {
+        if self.output_mode == OutputMode::Timeline {
+            return format!(
+                " Timeline{}{}{} ",
+                self.timeline_scope.title_suffix(),
+                self.timeline_event_filter.title_suffix(),
+                self.output_time_filter.title_suffix()
+            );
+        }
+
+        let filter = format!(
+            "{}{}",
+            self.output_filter.title_suffix(),
+            self.output_time_filter.title_suffix()
+        );
+        let scope = self.search_scope.title_suffix();
+        let agent = self.search_agent_title_suffix();
+        if let Some(input) = self.search_input.as_ref() {
+            return format!(" Output{filter}{scope}{agent} /{input}_ ");
+        }
+
+        if let Some(query) = self.search_query.as_ref() {
+            let total = self.search_matches.len();
+            let current = if total == 0 {
+                0
+            } else {
+                self.selected_search_match.min(total.saturating_sub(1)) + 1
+            };
+            return format!(" Output{filter}{scope}{agent} /{query} {current}/{total} ");
+        }
+
+        format!(" Output{filter}{scope}{agent} ")
+    }
+
+    fn empty_output_message(&self) -> &'static str {
+        match (self.output_filter, self.output_time_filter) {
+            (OutputFilter::All, OutputTimeFilter::AllTime) => "Waiting for session output...",
+            (OutputFilter::ErrorsOnly, OutputTimeFilter::AllTime) => {
+                "No stderr output for this session yet."
+            }
+            (OutputFilter::ToolCallsOnly, OutputTimeFilter::AllTime) => {
+                "No tool-call output for this session yet."
+            }
+            (OutputFilter::FileChangesOnly, OutputTimeFilter::AllTime) => {
+                "No file-change output for this session yet."
+            }
+            (OutputFilter::All, _) => "No output lines in the selected time range.",
+            (OutputFilter::ErrorsOnly, _) => "No stderr output in the selected time range.",
+            (OutputFilter::ToolCallsOnly, _) => "No tool-call output in the selected time range.",
+            (OutputFilter::FileChangesOnly, _) => {
+                "No file-change output in the selected time range."
+            }
+        }
+    }
+
+    fn empty_timeline_message(&self) -> &'static str {
+        match (
+            self.timeline_scope,
+            self.timeline_event_filter,
+            self.output_time_filter,
+        ) {
+            (SearchScope::AllSessions, TimelineEventFilter::All, OutputTimeFilter::AllTime) => {
+                "No timeline events across all sessions yet."
+            }
+            (
+                SearchScope::AllSessions,
+                TimelineEventFilter::Lifecycle,
+                OutputTimeFilter::AllTime,
+            ) => "No lifecycle events across all sessions yet.",
+            (
+                SearchScope::AllSessions,
+                TimelineEventFilter::Messages,
+                OutputTimeFilter::AllTime,
+            ) => "No message events across all sessions yet.",
+            (
+                SearchScope::AllSessions,
+                TimelineEventFilter::ToolCalls,
+                OutputTimeFilter::AllTime,
+            ) => "No tool-call events across all sessions yet.",
+            (
+                SearchScope::AllSessions,
+                TimelineEventFilter::FileChanges,
+                OutputTimeFilter::AllTime,
+            ) => "No file-change events across all sessions yet.",
+            (SearchScope::AllSessions, TimelineEventFilter::All, _) => {
+                "No timeline events across all sessions in the selected time range."
+            }
+            (SearchScope::AllSessions, TimelineEventFilter::Lifecycle, _) => {
+                "No lifecycle events across all sessions in the selected time range."
+            }
+            (SearchScope::AllSessions, TimelineEventFilter::Messages, _) => {
+                "No message events across all sessions in the selected time range."
+            }
+            (SearchScope::AllSessions, TimelineEventFilter::ToolCalls, _) => {
+                "No tool-call events across all sessions in the selected time range."
+            }
+            (SearchScope::AllSessions, TimelineEventFilter::FileChanges, _) => {
+                "No file-change events across all sessions in the selected time range."
+            }
+            (SearchScope::SelectedSession, TimelineEventFilter::All, OutputTimeFilter::AllTime) => {
+                "No timeline events for this session yet."
+            }
+            (
+                SearchScope::SelectedSession,
+                TimelineEventFilter::Lifecycle,
+                OutputTimeFilter::AllTime,
+            ) => "No lifecycle events for this session yet.",
+            (
+                SearchScope::SelectedSession,
+                TimelineEventFilter::Messages,
+                OutputTimeFilter::AllTime,
+            ) => "No message events for this session yet.",
+            (
+                SearchScope::SelectedSession,
+                TimelineEventFilter::ToolCalls,
+                OutputTimeFilter::AllTime,
+            ) => "No tool-call events for this session yet.",
+            (
+                SearchScope::SelectedSession,
+                TimelineEventFilter::FileChanges,
+                OutputTimeFilter::AllTime,
+            ) => "No file-change events for this session yet.",
+            (SearchScope::SelectedSession, TimelineEventFilter::All, _) => {
+                "No timeline events in the selected time range."
+            }
+            (SearchScope::SelectedSession, TimelineEventFilter::Lifecycle, _) => {
+                "No lifecycle events in the selected time range."
+            }
+            (SearchScope::SelectedSession, TimelineEventFilter::Messages, _) => {
+                "No message events in the selected time range."
+            }
+            (SearchScope::SelectedSession, TimelineEventFilter::ToolCalls, _) => {
+                "No tool-call events in the selected time range."
+            }
+            (SearchScope::SelectedSession, TimelineEventFilter::FileChanges, _) => {
+                "No file-change events in the selected time range."
+            }
+        }
+    }
+
+    fn render_searchable_output(&self, lines: &[&OutputLine]) -> Text<'static> {
+        let Some(query) = self.search_query.as_deref() else {
+            return Text::from(
+                lines
+                    .iter()
+                    .map(|line| Line::from(line.text.clone()))
+                    .collect::<Vec<_>>(),
+            );
+        };
+
+        let selected_session_id = self.selected_session_id();
+        let active_match = self.search_matches.get(self.selected_search_match);
+
+        Text::from(
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    highlight_output_line(
+                        &line.text,
+                        query,
+                        active_match
+                            .zip(selected_session_id)
+                            .map(|(search_match, session_id)| {
+                                search_match.session_id == session_id
+                                    && search_match.line_index == index
+                            })
+                            .unwrap_or(false),
+                        self.theme_palette(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn render_metrics(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Metrics ")
@@ -467,11 +835,13 @@ impl Dashboard {
             .split(inner);
 
         let aggregate = self.aggregate_usage();
+        let thresholds = self.cfg.effective_budget_alert_thresholds();
         frame.render_widget(
             TokenMeter::tokens(
                 "Token Budget",
                 aggregate.total_tokens,
                 self.cfg.token_budget,
+                thresholds,
             ),
             chunks[0],
         );
@@ -480,13 +850,17 @@ impl Dashboard {
                 "Cost Budget",
                 aggregate.total_cost_usd,
                 self.cfg.cost_budget_usd,
+                thresholds,
             ),
             chunks[1],
         );
         frame.render_widget(
-            Paragraph::new(self.selected_session_metrics_text()).wrap(Wrap { trim: true }),
+            Paragraph::new(self.selected_session_metrics_text())
+                .scroll((self.metrics_scroll_offset as u16, 0))
+                .wrap(Wrap { trim: true }),
             chunks[2],
         );
+        self.sync_metrics_scroll(chunks[2].height as usize);
     }
 
     fn render_log(&self, frame: &mut Frame, area: Rect) {
@@ -525,14 +899,51 @@ impl Dashboard {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let text = format!(
-            " [n]ew session  [a]ssign  re[b]alance  global re[B]alance  dra[i]n inbox  [g]lobal dispatch  coordinate [G]lobal  [v]iew diff  conflict proto[c]ol  [m]erge  merge ready [M]  auto-worktree [t]  auto-merge [w]  toggle [p]olicy  [,/.] dispatch limit  [s]top  [u]resume  [x]cleanup  prune inactive [X]  [d]elete  [r]efresh  [Tab] switch pane  [j/k] scroll  [+/-] resize  [{}] layout  [?] help  [q]uit ",
-            self.layout_label()
+        let base_text = format!(
+            " [n]ew session  natural spawn [N]  [a]ssign  re[b]alance  global re[B]alance  dra[i]n inbox  approval jump [I]  [g]lobal dispatch  coordinate [G]lobal  collapse pane [h]  restore panes [H]  timeline [y]  timeline filter [E]  [v]iew diff  conflict proto[c]ol  cont[e]nt filter  time [f]ilter  scope [A]  agent filter [o]  [m]erge  merge ready [M]  auto-worktree [t]  auto-merge [w]  toggle [p]olicy  [,/.] dispatch limit  [s]top  [u]resume  [x]cleanup  prune inactive [X]  [d]elete  [r]efresh  [{}] focus pane  [Tab] cycle pane  [{}] move pane  [j/k] scroll  delegate [ or ]  [Enter] open  [+/-] resize  [l]ayout {}  [T]heme {}  [?] help  [q]uit ",
+            self.pane_focus_shortcuts_label(),
+            self.pane_move_shortcuts_label(),
+            self.layout_label(),
+            self.theme_label()
         );
-        let text = if let Some(note) = self.operator_note.as_ref() {
-            format!(" {} |{}", truncate_for_dashboard(note, 96), text)
+
+        let search_prefix = if let Some(input) = self.spawn_input.as_ref() {
+            format!(" spawn>{input}_ | [Enter] queue [Esc] cancel |")
+        } else if let Some(input) = self.search_input.as_ref() {
+            format!(
+                " /{input}_ | {} | {} | [Enter] apply [Esc] cancel |",
+                self.search_scope.label(),
+                self.search_agent_filter_label()
+            )
+        } else if let Some(query) = self.search_query.as_ref() {
+            let total = self.search_matches.len();
+            let current = if total == 0 {
+                0
+            } else {
+                self.selected_search_match.min(total.saturating_sub(1)) + 1
+            };
+            format!(
+                " /{query} {current}/{total} | {} | {} | [n/N] navigate [Esc] clear |",
+                self.search_scope.label(),
+                self.search_agent_filter_label()
+            )
+        } else if self.pane_command_mode {
+            " Ctrl+w | [h/j/k/l] move [1-4] focus [s/v/g] layout [+/-] resize [Esc] cancel |"
+                .to_string()
         } else {
-            text
+            String::new()
+        };
+
+        let text = if self.spawn_input.is_some()
+            || self.search_input.is_some()
+            || self.search_query.is_some()
+            || self.pane_command_mode
+        {
+            format!(" {search_prefix}")
+        } else if let Some(note) = self.operator_note.as_ref() {
+            format!(" {} |{}", truncate_for_dashboard(note, 96), base_text)
+        } else {
+            base_text
         };
         let aggregate = self.aggregate_usage();
         let (summary_text, summary_style) = self.aggregate_cost_summary();
@@ -555,7 +966,7 @@ impl Dashboard {
             .split(inner);
 
         frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(text).style(Style::default().fg(self.theme_palette().muted)),
             chunks[0],
         );
         frame.render_widget(
@@ -568,44 +979,75 @@ impl Dashboard {
 
     fn render_help(&self, frame: &mut Frame, area: Rect) {
         let help = vec![
-            "Keyboard Shortcuts:",
-            "",
-            "  n       New session",
-            "  a       Assign follow-up work from selected session",
-            "  b       Rebalance backed-up delegate handoff backlog for selected lead",
-            "  B       Rebalance backed-up delegate handoff backlog across lead teams",
-            "  i       Drain unread task handoffs from selected lead",
-            "  g       Auto-dispatch unread handoffs across lead sessions",
-            "  G       Dispatch then rebalance backlog across lead teams",
-            "  v       Toggle selected worktree diff in output pane",
-            "  c       Show conflict-resolution protocol for selected conflicted worktree",
-            "  m       Merge selected ready worktree into base and clean it up",
-            "  M       Merge all ready inactive worktrees and clean them up",
-            "  t       Toggle default worktree creation for new sessions and delegated work",
-            "  p       Toggle daemon auto-dispatch policy and persist config",
-            "  w       Toggle daemon auto-merge for ready inactive worktrees",
-            "  ,/.     Decrease/increase auto-dispatch limit per lead",
-            "  s       Stop selected session",
-            "  u       Resume selected session",
-            "  x       Cleanup selected worktree",
-            "  X       Prune inactive worktrees globally",
-            "  d       Delete selected inactive session",
-            "  Tab     Next pane",
-            "  S-Tab   Previous pane",
-            "  j/↓     Scroll down",
-            "  k/↑     Scroll up",
-            "  +/=     Increase pane size",
-            "  -       Decrease pane size",
-            "  r       Refresh",
-            "  ?       Toggle help",
-            "  q/C-c   Quit",
+            "Keyboard Shortcuts:".to_string(),
+            "".to_string(),
+            "  n       New session".to_string(),
+            "  N       Natural-language multi-agent spawn prompt".to_string(),
+            "  a       Assign follow-up work from selected session".to_string(),
+            "  b       Rebalance backed-up delegate handoff backlog for selected lead".to_string(),
+            "  B       Rebalance backed-up delegate handoff backlog across lead teams".to_string(),
+            "  i       Drain unread task handoffs from selected lead".to_string(),
+            "  I       Jump to the next unread approval/conflict target session".to_string(),
+            "  g       Auto-dispatch unread handoffs across lead sessions".to_string(),
+            "  G       Dispatch then rebalance backlog across lead teams".to_string(),
+            "  h       Collapse the focused non-session pane".to_string(),
+            "  H       Restore all collapsed panes".to_string(),
+            "  y       Toggle selected-session timeline view".to_string(),
+            "  E       Cycle timeline event filter".to_string(),
+            "  v       Toggle selected worktree diff in output pane".to_string(),
+            "  c       Show conflict-resolution protocol for selected conflicted worktree"
+                .to_string(),
+            "  e       Cycle output content filter: all/errors/tool calls/file changes".to_string(),
+            "  f       Cycle output or timeline time range between all/15m/1h/24h".to_string(),
+            "  A       Toggle search or timeline scope between selected session and all sessions"
+                .to_string(),
+            "  o       Toggle search agent filter between all agents and selected agent type"
+                .to_string(),
+            "  m       Merge selected ready worktree into base and clean it up".to_string(),
+            "  M       Merge all ready inactive worktrees and clean them up".to_string(),
+            "  l       Cycle pane layout and persist it".to_string(),
+            "  T       Toggle theme and persist it".to_string(),
+            "  t       Toggle default worktree creation for new sessions and delegated work"
+                .to_string(),
+            "  p       Toggle daemon auto-dispatch policy and persist config".to_string(),
+            "  w       Toggle daemon auto-merge for ready inactive worktrees".to_string(),
+            "  ,/.     Decrease/increase auto-dispatch limit per lead".to_string(),
+            "  s       Stop selected session".to_string(),
+            "  u       Resume selected session".to_string(),
+            "  x       Cleanup selected worktree".to_string(),
+            "  X       Prune inactive worktrees globally".to_string(),
+            "  d       Delete selected inactive session".to_string(),
+            format!(
+                "  {:<7} Focus Sessions/Output/Metrics/Log directly",
+                self.pane_focus_shortcuts_label()
+            ),
+            "  Ctrl+w  Pane command mode: h/j/k/l move, s/v/g layout, 1-4 focus, +/- resize"
+                .to_string(),
+            "  Tab     Next pane".to_string(),
+            "  S-Tab   Previous pane".to_string(),
+            format!(
+                "  {:<7} Move pane focus left/down/up/right",
+                self.pane_move_shortcuts_label()
+            ),
+            "  j/↓     Scroll down".to_string(),
+            "  k/↑     Scroll up".to_string(),
+            "  [ or ]  Focus previous/next delegate in lead Metrics board".to_string(),
+            "  Enter   Open focused delegate from lead Metrics board".to_string(),
+            "  /       Search current session output".to_string(),
+            "  n/N     Next/previous search match when search is active".to_string(),
+            "  Esc     Clear active search or cancel search input".to_string(),
+            "  +/=     Increase pane size and persist it".to_string(),
+            "  -       Decrease pane size and persist it".to_string(),
+            "  r       Refresh".to_string(),
+            "  ?       Toggle help".to_string(),
+            "  q/C-c   Quit".to_string(),
         ];
 
         let paragraph = Paragraph::new(help.join("\n")).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Help ")
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(self.theme_palette().help_border)),
         );
         frame.render_widget(paragraph, area);
     }
@@ -632,16 +1074,373 @@ impl Dashboard {
         self.selected_pane = visible_panes[previous_index];
     }
 
+    pub fn focus_pane_number(&mut self, slot: usize) {
+        let Some(target) = Pane::from_shortcut(slot) else {
+            self.set_operator_note(format!("pane {slot} is not available"));
+            return;
+        };
+
+        if !self.visible_panes().contains(&target) {
+            self.set_operator_note(format!(
+                "{} pane is not visible",
+                target.title().to_lowercase()
+            ));
+            return;
+        }
+
+        self.focus_pane(target);
+    }
+
+    pub fn focus_pane_left(&mut self) {
+        self.move_pane_focus(PaneDirection::Left);
+    }
+
+    pub fn focus_pane_right(&mut self) {
+        self.move_pane_focus(PaneDirection::Right);
+    }
+
+    pub fn focus_pane_up(&mut self) {
+        self.move_pane_focus(PaneDirection::Up);
+    }
+
+    pub fn focus_pane_down(&mut self) {
+        self.move_pane_focus(PaneDirection::Down);
+    }
+
+    pub fn begin_pane_command_mode(&mut self) {
+        self.pane_command_mode = true;
+        self.set_operator_note(
+            "pane command mode | h/j/k/l move | s/v/g layout | 1-4 focus | +/- resize".to_string(),
+        );
+    }
+
+    pub fn is_pane_command_mode(&self) -> bool {
+        self.pane_command_mode
+    }
+
+    pub fn handle_pane_navigation_key(&mut self, key: KeyEvent) -> bool {
+        match self.cfg.pane_navigation.action_for_key(key) {
+            Some(PaneNavigationAction::FocusSlot(slot)) => {
+                self.focus_pane_number(slot);
+                true
+            }
+            Some(PaneNavigationAction::MoveLeft) => {
+                self.focus_pane_left();
+                true
+            }
+            Some(PaneNavigationAction::MoveDown) => {
+                self.focus_pane_down();
+                true
+            }
+            Some(PaneNavigationAction::MoveUp) => {
+                self.focus_pane_up();
+                true
+            }
+            Some(PaneNavigationAction::MoveRight) => {
+                self.focus_pane_right();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn handle_pane_command_key(&mut self, key: KeyEvent) -> bool {
+        if !self.pane_command_mode {
+            return false;
+        }
+
+        self.pane_command_mode = false;
+        match key.code {
+            crossterm::event::KeyCode::Esc => {
+                self.set_operator_note("pane command cancelled".to_string());
+            }
+            crossterm::event::KeyCode::Char('h') => self.focus_pane_left(),
+            crossterm::event::KeyCode::Char('j') => self.focus_pane_down(),
+            crossterm::event::KeyCode::Char('k') => self.focus_pane_up(),
+            crossterm::event::KeyCode::Char('l') => self.focus_pane_right(),
+            crossterm::event::KeyCode::Char('1') => self.focus_pane_number(1),
+            crossterm::event::KeyCode::Char('2') => self.focus_pane_number(2),
+            crossterm::event::KeyCode::Char('3') => self.focus_pane_number(3),
+            crossterm::event::KeyCode::Char('4') => self.focus_pane_number(4),
+            crossterm::event::KeyCode::Char('+') | crossterm::event::KeyCode::Char('=') => {
+                self.increase_pane_size()
+            }
+            crossterm::event::KeyCode::Char('-') => self.decrease_pane_size(),
+            crossterm::event::KeyCode::Char('s') => self.set_pane_layout(PaneLayout::Horizontal),
+            crossterm::event::KeyCode::Char('v') => self.set_pane_layout(PaneLayout::Vertical),
+            crossterm::event::KeyCode::Char('g') => self.set_pane_layout(PaneLayout::Grid),
+            _ => self.set_operator_note("unknown pane command".to_string()),
+        }
+        true
+    }
+
+    pub fn collapse_selected_pane(&mut self) {
+        if self.selected_pane == Pane::Sessions {
+            self.set_operator_note("cannot collapse sessions pane".to_string());
+            return;
+        }
+
+        if self.visible_detail_panes().len() <= 1 {
+            self.set_operator_note("cannot collapse last detail pane".to_string());
+            return;
+        }
+
+        let collapsed = self.selected_pane;
+        self.collapsed_panes.insert(collapsed);
+        self.ensure_selected_pane_visible();
+        self.set_operator_note(format!(
+            "collapsed {} pane",
+            collapsed.title().to_lowercase()
+        ));
+    }
+
+    pub fn restore_collapsed_panes(&mut self) {
+        if self.collapsed_panes.is_empty() {
+            self.set_operator_note("no collapsed panes".to_string());
+            return;
+        }
+
+        let restored_count = self.collapsed_panes.len();
+        self.collapsed_panes.clear();
+        self.ensure_selected_pane_visible();
+        self.set_operator_note(format!("restored {restored_count} collapsed pane(s)"));
+    }
+
+    pub fn cycle_pane_layout(&mut self) {
+        let config_path = crate::config::Config::config_path();
+        self.cycle_pane_layout_with_save(&config_path, |cfg| cfg.save());
+    }
+
+    pub fn set_pane_layout(&mut self, layout: PaneLayout) {
+        let config_path = crate::config::Config::config_path();
+        self.set_pane_layout_with_save(layout, &config_path, |cfg| cfg.save());
+    }
+
+    fn cycle_pane_layout_with_save<F>(&mut self, config_path: &std::path::Path, save: F)
+    where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        let previous_layout = self.cfg.pane_layout;
+        let previous_pane_size = self.pane_size_percent;
+        let previous_selected_pane = self.selected_pane;
+
+        self.cfg.pane_layout = match self.cfg.pane_layout {
+            PaneLayout::Horizontal => PaneLayout::Vertical,
+            PaneLayout::Vertical => PaneLayout::Grid,
+            PaneLayout::Grid => PaneLayout::Horizontal,
+        };
+        self.pane_size_percent = configured_pane_size(&self.cfg, self.cfg.pane_layout);
+        self.persist_current_pane_size();
+        self.ensure_selected_pane_visible();
+
+        match save(&self.cfg) {
+            Ok(()) => self.set_operator_note(format!(
+                "pane layout set to {} | saved to {}",
+                self.layout_label(),
+                config_path.display()
+            )),
+            Err(error) => {
+                self.cfg.pane_layout = previous_layout;
+                self.pane_size_percent = previous_pane_size;
+                self.selected_pane = previous_selected_pane;
+                self.set_operator_note(format!("failed to persist pane layout: {error}"));
+            }
+        }
+    }
+
+    fn set_pane_layout_with_save<F>(
+        &mut self,
+        layout: PaneLayout,
+        config_path: &std::path::Path,
+        save: F,
+    ) where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        if self.cfg.pane_layout == layout {
+            self.set_operator_note(format!("pane layout already {}", self.layout_label()));
+            return;
+        }
+
+        let previous_layout = self.cfg.pane_layout;
+        let previous_pane_size = self.pane_size_percent;
+        let previous_selected_pane = self.selected_pane;
+
+        self.cfg.pane_layout = layout;
+        self.pane_size_percent = configured_pane_size(&self.cfg, self.cfg.pane_layout);
+        self.persist_current_pane_size();
+        self.ensure_selected_pane_visible();
+
+        match save(&self.cfg) {
+            Ok(()) => self.set_operator_note(format!(
+                "pane layout set to {} | saved to {}",
+                self.layout_label(),
+                config_path.display()
+            )),
+            Err(error) => {
+                self.cfg.pane_layout = previous_layout;
+                self.pane_size_percent = previous_pane_size;
+                self.selected_pane = previous_selected_pane;
+                self.set_operator_note(format!("failed to persist pane layout: {error}"));
+            }
+        }
+    }
+
+    fn auto_split_layout_after_spawn(&mut self, spawned_count: usize) -> Option<String> {
+        let config_path = crate::config::Config::config_path();
+        self.auto_split_layout_after_spawn_with_save(spawned_count, &config_path, |cfg| cfg.save())
+    }
+
+    fn auto_split_layout_after_spawn_with_save<F>(
+        &mut self,
+        spawned_count: usize,
+        config_path: &std::path::Path,
+        save: F,
+    ) -> Option<String>
+    where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        if spawned_count <= 1 {
+            return None;
+        }
+
+        let live_session_count = self.active_session_count();
+        let target_layout = recommended_spawn_layout(live_session_count);
+        if self.cfg.pane_layout == target_layout {
+            self.selected_pane = Pane::Sessions;
+            self.ensure_selected_pane_visible();
+            return Some(format!(
+                "auto-focused sessions in {} layout for {} live session(s)",
+                pane_layout_name(target_layout),
+                live_session_count
+            ));
+        }
+
+        let previous_layout = self.cfg.pane_layout;
+        let previous_pane_size = self.pane_size_percent;
+        let previous_selected_pane = self.selected_pane;
+
+        self.cfg.pane_layout = target_layout;
+        self.pane_size_percent = configured_pane_size(&self.cfg, target_layout);
+        self.persist_current_pane_size();
+        self.selected_pane = Pane::Sessions;
+        self.ensure_selected_pane_visible();
+
+        match save(&self.cfg) {
+            Ok(()) => Some(format!(
+                "auto-split {} layout for {} live session(s)",
+                pane_layout_name(target_layout),
+                live_session_count
+            )),
+            Err(error) => {
+                self.cfg.pane_layout = previous_layout;
+                self.pane_size_percent = previous_pane_size;
+                self.selected_pane = previous_selected_pane;
+                Some(format!(
+                    "spawned {} session(s) but failed to persist auto-split layout to {}: {error}",
+                    spawned_count,
+                    config_path.display()
+                ))
+            }
+        }
+    }
+
+    fn adjust_pane_size_with_save<F>(
+        &mut self,
+        delta: isize,
+        config_path: &std::path::Path,
+        save: F,
+    ) where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        let previous_size = self.pane_size_percent;
+        let previous_linear = self.cfg.linear_pane_size_percent;
+        let previous_grid = self.cfg.grid_pane_size_percent;
+        let next = (self.pane_size_percent as isize + delta).clamp(
+            MIN_PANE_SIZE_PERCENT as isize,
+            MAX_PANE_SIZE_PERCENT as isize,
+        ) as u16;
+
+        if next == self.pane_size_percent {
+            self.set_operator_note(format!(
+                "pane size unchanged at {}% for {} layout",
+                self.pane_size_percent,
+                self.layout_label()
+            ));
+            return;
+        }
+
+        self.pane_size_percent = next;
+        self.persist_current_pane_size();
+
+        match save(&self.cfg) {
+            Ok(()) => self.set_operator_note(format!(
+                "pane size set to {}% for {} layout | saved to {}",
+                self.pane_size_percent,
+                self.layout_label(),
+                config_path.display()
+            )),
+            Err(error) => {
+                self.pane_size_percent = previous_size;
+                self.cfg.linear_pane_size_percent = previous_linear;
+                self.cfg.grid_pane_size_percent = previous_grid;
+                self.set_operator_note(format!("failed to persist pane size: {error}"));
+            }
+        }
+    }
+
+    fn persist_current_pane_size(&mut self) {
+        match self.cfg.pane_layout {
+            PaneLayout::Horizontal | PaneLayout::Vertical => {
+                self.cfg.linear_pane_size_percent = self.pane_size_percent;
+            }
+            PaneLayout::Grid => {
+                self.cfg.grid_pane_size_percent = self.pane_size_percent;
+            }
+        }
+    }
+
+    pub fn toggle_theme(&mut self) {
+        let config_path = crate::config::Config::config_path();
+        self.toggle_theme_with_save(&config_path, |cfg| cfg.save());
+    }
+
+    fn toggle_theme_with_save<F>(&mut self, config_path: &std::path::Path, save: F)
+    where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        let previous_theme = self.cfg.theme;
+        self.cfg.theme = match self.cfg.theme {
+            Theme::Dark => Theme::Light,
+            Theme::Light => Theme::Dark,
+        };
+
+        match save(&self.cfg) {
+            Ok(()) => self.set_operator_note(format!(
+                "theme set to {} | saved to {}",
+                self.theme_label(),
+                config_path.display()
+            )),
+            Err(error) => {
+                self.cfg.theme = previous_theme;
+                self.set_operator_note(format!("failed to persist theme: {error}"));
+            }
+        }
+    }
+
     pub fn increase_pane_size(&mut self) {
-        self.pane_size_percent =
-            (self.pane_size_percent + PANE_RESIZE_STEP_PERCENT).min(MAX_PANE_SIZE_PERCENT);
+        let config_path = crate::config::Config::config_path();
+        self.adjust_pane_size_with_save(PANE_RESIZE_STEP_PERCENT as isize, &config_path, |cfg| {
+            cfg.save()
+        });
     }
 
     pub fn decrease_pane_size(&mut self) {
-        self.pane_size_percent = self
-            .pane_size_percent
-            .saturating_sub(PANE_RESIZE_STEP_PERCENT)
-            .max(MIN_PANE_SIZE_PERCENT);
+        let config_path = crate::config::Config::config_path();
+        self.adjust_pane_size_with_save(
+            -(PANE_RESIZE_STEP_PERCENT as isize),
+            &config_path,
+            |cfg| cfg.save(),
+        );
     }
 
     pub fn scroll_down(&mut self) {
@@ -650,6 +1449,7 @@ impl Dashboard {
                 self.selected_session = (self.selected_session + 1).min(self.sessions.len() - 1);
                 self.sync_selection();
                 self.reset_output_view();
+                self.reset_metrics_view();
                 self.sync_selected_output();
                 self.sync_selected_diff();
                 self.sync_selected_messages();
@@ -669,7 +1469,11 @@ impl Dashboard {
                     self.output_scroll_offset = self.output_scroll_offset.saturating_add(1);
                 }
             }
-            Pane::Metrics => {}
+            Pane::Metrics => {
+                let max_scroll = self.max_metrics_scroll();
+                self.metrics_scroll_offset =
+                    self.metrics_scroll_offset.saturating_add(1).min(max_scroll);
+            }
             Pane::Log => {
                 self.output_follow = false;
                 self.output_scroll_offset = self.output_scroll_offset.saturating_add(1);
@@ -684,6 +1488,7 @@ impl Dashboard {
                 self.selected_session = self.selected_session.saturating_sub(1);
                 self.sync_selection();
                 self.reset_output_view();
+                self.reset_metrics_view();
                 self.sync_selected_output();
                 self.sync_selected_diff();
                 self.sync_selected_messages();
@@ -698,12 +1503,79 @@ impl Dashboard {
 
                 self.output_scroll_offset = self.output_scroll_offset.saturating_sub(1);
             }
-            Pane::Metrics => {}
+            Pane::Metrics => {
+                self.metrics_scroll_offset = self.metrics_scroll_offset.saturating_sub(1);
+            }
             Pane::Log => {
                 self.output_follow = false;
                 self.output_scroll_offset = self.output_scroll_offset.saturating_sub(1);
             }
         }
+    }
+
+    pub fn focus_next_delegate(&mut self) {
+        let Some(current_index) = self.focused_delegate_index() else {
+            return;
+        };
+        let next_index = (current_index + 1) % self.selected_child_sessions.len();
+        self.set_focused_delegate_by_index(next_index);
+    }
+
+    pub fn focus_previous_delegate(&mut self) {
+        let Some(current_index) = self.focused_delegate_index() else {
+            return;
+        };
+        let previous_index = if current_index == 0 {
+            self.selected_child_sessions.len() - 1
+        } else {
+            current_index - 1
+        };
+        self.set_focused_delegate_by_index(previous_index);
+    }
+
+    pub fn open_focused_delegate(&mut self) {
+        let Some(delegate_session_id) = self
+            .focused_delegate_index()
+            .and_then(|index| self.selected_child_sessions.get(index))
+            .map(|delegate| delegate.session_id.clone())
+        else {
+            return;
+        };
+
+        self.sync_selection_by_id(Some(&delegate_session_id));
+        self.reset_output_view();
+        self.reset_metrics_view();
+        self.sync_selected_output();
+        self.sync_selected_diff();
+        self.sync_selected_messages();
+        self.sync_selected_lineage();
+        self.refresh_logs();
+        self.set_operator_note(format!(
+            "opened delegate {}",
+            format_session_id(&delegate_session_id)
+        ));
+    }
+
+    pub fn focus_next_approval_target(&mut self) {
+        self.sync_approval_queue();
+        let Some(target_session_id) = self.next_approval_target_session_id() else {
+            self.set_operator_note("approval queue clear".to_string());
+            return;
+        };
+
+        self.sync_selection_by_id(Some(&target_session_id));
+        self.reset_output_view();
+        self.reset_metrics_view();
+        self.sync_selected_output();
+        self.sync_selected_diff();
+        self.unread_message_counts = self.db.unread_message_counts().unwrap_or_default();
+        self.sync_selected_messages();
+        self.sync_selected_lineage();
+        self.refresh_logs();
+        self.set_operator_note(format!(
+            "focused approval target {}",
+            format_session_id(&target_session_id)
+        ));
     }
 
     pub async fn new_session(&mut self) {
@@ -712,6 +1584,10 @@ impl Dashboard {
                 "Cannot queue new session: active session limit reached ({})",
                 self.cfg.max_parallel_sessions
             );
+            self.set_operator_note(format!(
+                "cannot queue new session: active session limit reached ({})",
+                self.cfg.max_parallel_sessions
+            ));
             return;
         }
 
@@ -780,6 +1656,7 @@ impl Dashboard {
         self.sync_selected_messages();
         self.sync_selected_lineage();
         self.refresh_logs();
+        self.sync_budget_alerts();
     }
 
     pub fn toggle_output_mode(&mut self) {
@@ -800,10 +1677,36 @@ impl Dashboard {
                 self.reset_output_view();
                 self.set_operator_note("showing session output".to_string());
             }
+            OutputMode::Timeline => {
+                self.output_mode = OutputMode::SessionOutput;
+                self.reset_output_view();
+                self.set_operator_note("showing session output".to_string());
+            }
             OutputMode::ConflictProtocol => {
                 self.output_mode = OutputMode::SessionOutput;
                 self.reset_output_view();
                 self.set_operator_note("showing session output".to_string());
+            }
+        }
+    }
+
+    pub fn toggle_timeline_mode(&mut self) {
+        match self.output_mode {
+            OutputMode::Timeline => {
+                self.output_mode = OutputMode::SessionOutput;
+                self.reset_output_view();
+                self.set_operator_note("showing session output".to_string());
+            }
+            _ => {
+                if self.sessions.get(self.selected_session).is_some() {
+                    self.output_mode = OutputMode::Timeline;
+                    self.selected_pane = Pane::Output;
+                    self.output_follow = false;
+                    self.output_scroll_offset = 0;
+                    self.set_operator_note("showing selected session timeline".to_string());
+                } else {
+                    self.set_operator_note("no session selected for timeline view".to_string());
+                }
             }
         }
     }
@@ -1370,6 +2273,375 @@ impl Dashboard {
         self.show_help = !self.show_help;
     }
 
+    pub fn is_input_mode(&self) -> bool {
+        self.spawn_input.is_some() || self.search_input.is_some()
+    }
+
+    pub fn has_active_search(&self) -> bool {
+        self.search_query.is_some()
+    }
+
+    pub fn begin_spawn_prompt(&mut self) {
+        if self.search_input.is_some() {
+            self.set_operator_note(
+                "finish output search input before opening spawn prompt".to_string(),
+            );
+            return;
+        }
+
+        self.spawn_input = Some(self.spawn_prompt_seed());
+        self.set_operator_note(
+            "spawn mode | try: give me 3 agents working on fix flaky tests".to_string(),
+        );
+    }
+
+    pub fn toggle_search_scope(&mut self) {
+        if self.output_mode == OutputMode::Timeline {
+            self.timeline_scope = self.timeline_scope.next();
+            self.sync_output_scroll(self.last_output_height.max(1));
+            self.set_operator_note(format!(
+                "timeline scope set to {}",
+                self.timeline_scope.label()
+            ));
+            return;
+        }
+
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note(
+                "scope toggle is only available in session output or timeline view".to_string(),
+            );
+            return;
+        }
+
+        self.search_scope = self.search_scope.next();
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+
+        if self.search_query.is_some() {
+            self.set_operator_note(format!(
+                "search scope set to {} | {} match(es)",
+                self.search_scope.label(),
+                self.search_matches.len()
+            ));
+        } else {
+            self.set_operator_note(format!("search scope set to {}", self.search_scope.label()));
+        }
+    }
+
+    pub fn toggle_search_agent_filter(&mut self) {
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note(
+                "search agent filter is only available in session output view".to_string(),
+            );
+            return;
+        }
+
+        let Some(selected_agent_type) = self.selected_agent_type().map(str::to_owned) else {
+            self.set_operator_note("search agent filter requires a selected session".to_string());
+            return;
+        };
+
+        self.search_agent_filter = match self.search_agent_filter {
+            SearchAgentFilter::AllAgents => SearchAgentFilter::SelectedAgentType,
+            SearchAgentFilter::SelectedAgentType => SearchAgentFilter::AllAgents,
+        };
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+
+        if self.search_query.is_some() {
+            self.set_operator_note(format!(
+                "search agent filter set to {} | {} match(es)",
+                self.search_agent_filter.label(&selected_agent_type),
+                self.search_matches.len()
+            ));
+        } else {
+            self.set_operator_note(format!(
+                "search agent filter set to {}",
+                self.search_agent_filter.label(&selected_agent_type)
+            ));
+        }
+    }
+
+    pub fn begin_search(&mut self) {
+        if self.spawn_input.is_some() {
+            self.set_operator_note("finish spawn prompt before searching output".to_string());
+            return;
+        }
+
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note("search is only available in session output view".to_string());
+            return;
+        }
+
+        self.search_input = Some(self.search_query.clone().unwrap_or_default());
+        self.set_operator_note("search mode | type a query and press Enter".to_string());
+    }
+
+    pub fn push_input_char(&mut self, ch: char) {
+        if let Some(input) = self.spawn_input.as_mut() {
+            input.push(ch);
+        } else if let Some(input) = self.search_input.as_mut() {
+            input.push(ch);
+        }
+    }
+
+    pub fn pop_input_char(&mut self) {
+        if let Some(input) = self.spawn_input.as_mut() {
+            input.pop();
+        } else if let Some(input) = self.search_input.as_mut() {
+            input.pop();
+        }
+    }
+
+    pub fn cancel_input(&mut self) {
+        if self.spawn_input.take().is_some() {
+            self.set_operator_note("spawn input cancelled".to_string());
+        } else if self.search_input.take().is_some() {
+            self.set_operator_note("search input cancelled".to_string());
+        }
+    }
+
+    pub async fn submit_input(&mut self) {
+        if self.spawn_input.is_some() {
+            self.submit_spawn_prompt().await;
+        } else {
+            self.submit_search();
+        }
+    }
+
+    fn submit_search(&mut self) {
+        let Some(input) = self.search_input.take() else {
+            return;
+        };
+
+        let query = input.trim().to_string();
+        if query.is_empty() {
+            self.clear_search();
+            return;
+        }
+
+        if let Err(error) = compile_search_regex(&query) {
+            self.search_input = Some(query.clone());
+            self.set_operator_note(format!("invalid regex /{query}: {error}"));
+            return;
+        }
+
+        self.search_query = Some(query.clone());
+        self.recompute_search_matches();
+        if self.search_matches.is_empty() {
+            self.set_operator_note(format!("search /{query} found no matches"));
+        } else {
+            self.set_operator_note(format!(
+                "search /{query} matched {} line(s) across {} session(s) | n/N navigate matches",
+                self.search_matches.len(),
+                self.search_match_session_count()
+            ));
+        }
+    }
+
+    async fn submit_spawn_prompt(&mut self) {
+        let Some(input) = self.spawn_input.take() else {
+            return;
+        };
+
+        let plan = match self.build_spawn_plan(&input) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.spawn_input = Some(input);
+                self.set_operator_note(error);
+                return;
+            }
+        };
+
+        let source_session = self.sessions.get(self.selected_session).cloned();
+        let handoff_context = source_session.as_ref().map(|session| {
+            format!(
+                "Dashboard handoff from {} [{}] | cwd {}{}",
+                format_session_id(&session.id),
+                session.agent_type,
+                session.working_dir.display(),
+                session
+                    .worktree
+                    .as_ref()
+                    .map(|worktree| format!(
+                        " | worktree {} ({})",
+                        worktree.branch,
+                        worktree.path.display()
+                    ))
+                    .unwrap_or_default()
+            )
+        });
+        let source_task = source_session.as_ref().map(|session| session.task.clone());
+        let source_session_id = source_session.as_ref().map(|session| session.id.clone());
+        let agent = self.cfg.default_agent.clone();
+        let mut created_ids = Vec::new();
+
+        for task in expand_spawn_tasks(&plan.task, plan.spawn_count) {
+            let session_id = match manager::create_session(
+                &self.db,
+                &self.cfg,
+                &task,
+                &agent,
+                self.cfg.auto_create_worktrees,
+            )
+            .await
+            {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    let preferred_selection =
+                        post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
+                    self.refresh_after_spawn(preferred_selection.as_deref());
+                    let mut summary = if created_ids.is_empty() {
+                        format!("spawn failed: {error}")
+                    } else {
+                        format!(
+                            "spawn partially completed: {} of {} queued before failure: {error}",
+                            created_ids.len(),
+                            plan.spawn_count
+                        )
+                    };
+                    if let Some(layout_note) = self.auto_split_layout_after_spawn(created_ids.len())
+                    {
+                        summary.push_str(" | ");
+                        summary.push_str(&layout_note);
+                    }
+                    self.set_operator_note(summary);
+                    return;
+                }
+            };
+
+            if let (Some(source_id), Some(task), Some(context)) = (
+                source_session_id.as_ref(),
+                source_task.as_ref(),
+                handoff_context.as_ref(),
+            ) {
+                if let Err(error) = comms::send(
+                    &self.db,
+                    source_id,
+                    &session_id,
+                    &comms::MessageType::TaskHandoff {
+                        task: task.clone(),
+                        context: context.clone(),
+                    },
+                ) {
+                    tracing::warn!(
+                        "Failed to send handoff from session {} to {}: {error}",
+                        source_id,
+                        session_id
+                    );
+                }
+            }
+
+            created_ids.push(session_id);
+        }
+
+        let preferred_selection =
+            post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
+        self.refresh_after_spawn(preferred_selection.as_deref());
+        let mut note = build_spawn_note(&plan, created_ids.len());
+        if let Some(layout_note) = self.auto_split_layout_after_spawn(created_ids.len()) {
+            note.push_str(" | ");
+            note.push_str(&layout_note);
+        }
+        self.set_operator_note(note);
+    }
+
+    pub fn clear_search(&mut self) {
+        let had_query = self.search_query.take().is_some();
+        let had_input = self.search_input.take().is_some();
+        self.search_matches.clear();
+        self.selected_search_match = 0;
+        if had_query || had_input {
+            self.set_operator_note("cleared output search".to_string());
+        }
+    }
+
+    pub fn next_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            self.set_operator_note("no output search matches to navigate".to_string());
+            return;
+        }
+
+        self.selected_search_match = (self.selected_search_match + 1) % self.search_matches.len();
+        self.focus_selected_search_match();
+        self.set_operator_note(self.search_navigation_note());
+    }
+
+    pub fn prev_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            self.set_operator_note("no output search matches to navigate".to_string());
+            return;
+        }
+
+        self.selected_search_match = if self.selected_search_match == 0 {
+            self.search_matches.len() - 1
+        } else {
+            self.selected_search_match - 1
+        };
+        self.focus_selected_search_match();
+        self.set_operator_note(self.search_navigation_note());
+    }
+
+    pub fn toggle_output_filter(&mut self) {
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note(
+                "output filters are only available in session output view".to_string(),
+            );
+            return;
+        }
+
+        self.output_filter = self.output_filter.next();
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+        self.set_operator_note(format!(
+            "output filter set to {}",
+            self.output_filter.label()
+        ));
+    }
+
+    pub fn cycle_output_time_filter(&mut self) {
+        if !matches!(
+            self.output_mode,
+            OutputMode::SessionOutput | OutputMode::Timeline
+        ) {
+            self.set_operator_note(
+                "time filters are only available in session output or timeline view".to_string(),
+            );
+            return;
+        }
+
+        self.output_time_filter = self.output_time_filter.next();
+        if self.output_mode == OutputMode::SessionOutput {
+            self.recompute_search_matches();
+        }
+        self.sync_output_scroll(self.last_output_height.max(1));
+        let note_prefix = if self.output_mode == OutputMode::Timeline {
+            "timeline range"
+        } else {
+            "output time filter"
+        };
+        self.set_operator_note(format!(
+            "{note_prefix} set to {}",
+            self.output_time_filter.label()
+        ));
+    }
+
+    pub fn cycle_timeline_event_filter(&mut self) {
+        if self.output_mode != OutputMode::Timeline {
+            self.set_operator_note(
+                "timeline event filters are only available in timeline view".to_string(),
+            );
+            return;
+        }
+
+        self.timeline_event_filter = self.timeline_event_filter.next();
+        self.sync_output_scroll(self.last_output_height.max(1));
+        self.set_operator_note(format!(
+            "timeline filter set to {}",
+            self.timeline_event_filter.label()
+        ));
+    }
+
     pub fn toggle_auto_dispatch_policy(&mut self) {
         self.cfg.auto_dispatch_unread_handoffs = !self.cfg.auto_dispatch_unread_handoffs;
         match self.cfg.save() {
@@ -1474,7 +2746,33 @@ impl Dashboard {
         self.sync_from_store();
     }
 
+    fn sync_runtime_metrics(&mut self) -> Option<manager::BudgetEnforcementOutcome> {
+        if let Err(error) = self.db.refresh_session_durations() {
+            tracing::warn!("Failed to refresh session durations: {error}");
+        }
+
+        let metrics_path = self.cfg.cost_metrics_path();
+        let signature = cost_metrics_signature(&metrics_path);
+        if signature != self.last_cost_metrics_signature {
+            self.last_cost_metrics_signature = signature;
+            if signature.is_some() {
+                if let Err(error) = self.db.sync_cost_tracker_metrics(&metrics_path) {
+                    tracing::warn!("Failed to sync cost tracker metrics: {error}");
+                }
+            }
+        }
+
+        match manager::enforce_budget_hard_limits(&self.db, &self.cfg) {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                tracing::warn!("Failed to enforce budget hard limits: {error}");
+                None
+            }
+        }
+    }
+
     fn sync_from_store(&mut self) {
+        let budget_enforcement = self.sync_runtime_metrics();
         let selected_id = self.selected_session_id().map(ToOwned::to_owned);
         self.sessions = match self.db.list_sessions() {
             Ok(sessions) => sessions,
@@ -1494,6 +2792,7 @@ impl Dashboard {
         self.sync_worktree_health_by_session();
         self.sync_global_handoff_backlog();
         self.sync_daemon_activity();
+        self.sync_output_cache();
         self.sync_selection_by_id(selected_id.as_deref());
         self.ensure_selected_pane_visible();
         self.sync_selected_output();
@@ -1501,6 +2800,56 @@ impl Dashboard {
         self.sync_selected_messages();
         self.sync_selected_lineage();
         self.refresh_logs();
+        self.sync_budget_alerts();
+
+        if let Some(outcome) =
+            budget_enforcement.filter(|outcome| !outcome.paused_sessions.is_empty())
+        {
+            self.set_operator_note(budget_auto_pause_note(&outcome));
+        }
+    }
+
+    fn sync_budget_alerts(&mut self) {
+        let aggregate = self.aggregate_usage();
+        let thresholds = self.cfg.effective_budget_alert_thresholds();
+        let current_state = aggregate.overall_state;
+        if current_state == self.last_budget_alert_state {
+            return;
+        }
+
+        let previous_state = self.last_budget_alert_state;
+        self.last_budget_alert_state = current_state;
+
+        if current_state <= previous_state {
+            return;
+        }
+
+        let Some(summary_suffix) = current_state.summary_suffix(thresholds) else {
+            return;
+        };
+
+        let token_budget = if self.cfg.token_budget > 0 {
+            format!(
+                "{} / {}",
+                format_token_count(aggregate.total_tokens),
+                format_token_count(self.cfg.token_budget)
+            )
+        } else {
+            format!("{} / no budget", format_token_count(aggregate.total_tokens))
+        };
+        let cost_budget = if self.cfg.cost_budget_usd > 0.0 {
+            format!(
+                "{} / {}",
+                format_currency(aggregate.total_cost_usd),
+                format_currency(self.cfg.cost_budget_usd)
+            )
+        } else {
+            format!("{} / no budget", format_currency(aggregate.total_cost_usd))
+        };
+
+        self.set_operator_note(format!(
+            "{summary_suffix} | tokens {token_budget} | cost {cost_budget}"
+        ));
     }
 
     fn sync_selection(&mut self) {
@@ -1526,10 +2875,84 @@ impl Dashboard {
         self.sync_selection();
     }
 
+    fn sync_output_cache(&mut self) {
+        let active_session_ids: HashSet<_> = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        self.session_output_cache
+            .retain(|session_id, _| active_session_ids.contains(session_id.as_str()));
+
+        for session in &self.sessions {
+            match self.db.get_output_lines(&session.id, OUTPUT_BUFFER_LIMIT) {
+                Ok(lines) => {
+                    self.output_store.replace_lines(&session.id, lines.clone());
+                    self.session_output_cache.insert(session.id.clone(), lines);
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to load session output for {}: {error}", session.id);
+                }
+            }
+        }
+    }
+
     fn ensure_selected_pane_visible(&mut self) {
         if !self.visible_panes().contains(&self.selected_pane) {
             self.selected_pane = Pane::Sessions;
         }
+    }
+
+    fn focus_pane(&mut self, pane: Pane) {
+        self.selected_pane = pane;
+        self.ensure_selected_pane_visible();
+        self.set_operator_note(format!("focused {} pane", pane.title().to_lowercase()));
+    }
+
+    fn move_pane_focus(&mut self, direction: PaneDirection) {
+        let visible_panes = self.visible_panes();
+        if visible_panes.len() <= 1 {
+            return;
+        }
+
+        let pane_areas = self.pane_areas(Rect::new(0, 0, 100, 40));
+        let Some(current_rect) = pane_rect(&pane_areas, self.selected_pane) else {
+            return;
+        };
+        let current_center = pane_center(current_rect);
+
+        let candidate = visible_panes
+            .into_iter()
+            .filter(|pane| *pane != self.selected_pane)
+            .filter_map(|pane| {
+                let rect = pane_rect(&pane_areas, pane)?;
+                let center = pane_center(rect);
+                let dx = center.0 - current_center.0;
+                let dy = center.1 - current_center.1;
+
+                let (primary, secondary) = match direction {
+                    PaneDirection::Left if dx < 0 => ((-dx) as u16, dy.unsigned_abs()),
+                    PaneDirection::Right if dx > 0 => (dx as u16, dy.unsigned_abs()),
+                    PaneDirection::Up if dy < 0 => ((-dy) as u16, dx.unsigned_abs()),
+                    PaneDirection::Down if dy > 0 => (dy as u16, dx.unsigned_abs()),
+                    _ => return None,
+                };
+
+                Some((pane, primary, secondary))
+            })
+            .min_by_key(|(pane, primary, secondary)| (*primary, *secondary, pane.sort_key()));
+
+        if let Some((pane, _, _)) = candidate {
+            self.focus_pane(pane);
+        }
+    }
+
+    fn pane_focus_shortcuts_label(&self) -> String {
+        self.cfg.pane_navigation.focus_shortcuts_label()
+    }
+
+    fn pane_move_shortcuts_label(&self) -> String {
+        self.cfg.pane_navigation.movement_shortcuts_label()
     }
 
     fn sync_global_handoff_backlog(&mut self) {
@@ -1546,6 +2969,23 @@ impl Dashboard {
                 self.global_handoff_backlog_messages = 0;
             }
         }
+    }
+
+    fn sync_approval_queue(&mut self) {
+        self.approval_queue_counts = match self.db.unread_approval_counts() {
+            Ok(counts) => counts,
+            Err(error) => {
+                tracing::warn!("Failed to refresh approval queue counts: {error}");
+                HashMap::new()
+            }
+        };
+        self.approval_queue_preview = match self.db.unread_approval_queue(3) {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!("Failed to refresh approval queue preview: {error}");
+                Vec::new()
+            }
+        };
     }
 
     fn sync_handoff_backlog_counts(&mut self) {
@@ -1594,21 +3034,15 @@ impl Dashboard {
     }
 
     fn sync_selected_output(&mut self) {
-        let Some(session_id) = self.selected_session_id().map(ToOwned::to_owned) else {
+        if self.selected_session_id().is_none() {
             self.output_scroll_offset = 0;
             self.output_follow = true;
+            self.search_matches.clear();
+            self.selected_search_match = 0;
             return;
-        };
-
-        match self.db.get_output_lines(&session_id, OUTPUT_BUFFER_LIMIT) {
-            Ok(lines) => {
-                self.output_store.replace_lines(&session_id, lines.clone());
-                self.session_output_cache.insert(session_id, lines);
-            }
-            Err(error) => {
-                tracing::warn!("Failed to load session output: {error}");
-            }
         }
+
+        self.recompute_search_matches();
     }
 
     fn sync_selected_diff(&mut self) {
@@ -1646,6 +3080,7 @@ impl Dashboard {
     fn sync_selected_messages(&mut self) {
         let Some(session_id) = self.selected_session_id().map(ToOwned::to_owned) else {
             self.selected_messages.clear();
+            self.sync_approval_queue();
             return;
         };
 
@@ -1675,12 +3110,15 @@ impl Dashboard {
                 Vec::new()
             }
         };
+
+        self.sync_approval_queue();
     }
 
     fn sync_selected_lineage(&mut self) {
         let Some(session_id) = self.selected_session_id().map(ToOwned::to_owned) else {
             self.selected_parent_session = None;
             self.selected_child_sessions.clear();
+            self.focused_delegate_session_id = None;
             self.selected_team_summary = None;
             self.selected_route_preview = None;
             return;
@@ -1704,6 +3142,11 @@ impl Dashboard {
                     match self.db.get_session(&child_id) {
                         Ok(Some(session)) => {
                             team.total += 1;
+                            let approval_backlog = self
+                                .approval_queue_counts
+                                .get(&child_id)
+                                .copied()
+                                .unwrap_or(0);
                             let handoff_backlog = match self.db.unread_task_handoff_count(&child_id)
                             {
                                 Ok(count) => count,
@@ -1726,14 +3169,52 @@ impl Dashboard {
                             }
 
                             route_candidates.push(DelegatedChildSummary {
+                                worktree_health: self
+                                    .worktree_health_by_session
+                                    .get(&child_id)
+                                    .copied(),
+                                approval_backlog,
                                 handoff_backlog,
                                 state: state.clone(),
                                 session_id: child_id.clone(),
+                                tokens_used: session.metrics.tokens_used,
+                                files_changed: session.metrics.files_changed,
+                                duration_secs: session.metrics.duration_secs,
+                                task_preview: truncate_for_dashboard(&session.task, 40),
+                                branch: session
+                                    .worktree
+                                    .as_ref()
+                                    .map(|worktree| worktree.branch.clone()),
+                                last_output_preview: self
+                                    .db
+                                    .get_output_lines(&child_id, 1)
+                                    .ok()
+                                    .and_then(|lines| lines.last().cloned())
+                                    .map(|line| truncate_for_dashboard(&line.text, 48)),
                             });
                             delegated.push(DelegatedChildSummary {
+                                worktree_health: self
+                                    .worktree_health_by_session
+                                    .get(&session.id)
+                                    .copied(),
+                                approval_backlog,
                                 handoff_backlog,
                                 state,
                                 session_id: child_id,
+                                tokens_used: session.metrics.tokens_used,
+                                files_changed: session.metrics.files_changed,
+                                duration_secs: session.metrics.duration_secs,
+                                task_preview: truncate_for_dashboard(&session.task, 40),
+                                branch: session
+                                    .worktree
+                                    .as_ref()
+                                    .map(|worktree| worktree.branch.clone()),
+                                last_output_preview: self
+                                    .db
+                                    .get_output_lines(&session.id, 1)
+                                    .ok()
+                                    .and_then(|lines| lines.last().cloned())
+                                    .map(|line| truncate_for_dashboard(&line.text, 48)),
                             });
                         }
                         Ok(None) => {}
@@ -1749,7 +3230,14 @@ impl Dashboard {
                 self.selected_team_summary = if team.total > 0 { Some(team) } else { None };
                 self.selected_route_preview =
                     self.build_route_preview(team.total, &route_candidates);
-                delegated.truncate(3);
+                delegated.sort_by_key(|delegate| {
+                    (
+                        delegate_attention_priority(delegate),
+                        std::cmp::Reverse(delegate.approval_backlog),
+                        std::cmp::Reverse(delegate.handoff_backlog),
+                        delegate.session_id.clone(),
+                    )
+                });
                 delegated
             }
             Err(error) => {
@@ -1759,6 +3247,7 @@ impl Dashboard {
                 Vec::new()
             }
         };
+        self.sync_focused_delegate_selection();
     }
 
     fn build_route_preview(
@@ -1832,6 +3321,324 @@ impl Dashboard {
             .unwrap_or(&[])
     }
 
+    fn selected_agent_type(&self) -> Option<&str> {
+        self.sessions
+            .get(self.selected_session)
+            .map(|session| session.agent_type.as_str())
+    }
+
+    fn search_agent_filter_label(&self) -> String {
+        self.search_agent_filter
+            .label(self.selected_agent_type().unwrap_or("selected agent"))
+            .to_string()
+    }
+
+    fn search_agent_title_suffix(&self) -> String {
+        match self.selected_agent_type() {
+            Some(agent_type) => self
+                .search_agent_filter
+                .title_suffix(agent_type)
+                .to_string(),
+            None => String::new(),
+        }
+    }
+
+    fn visible_output_lines_for_session(&self, session_id: &str) -> Vec<&OutputLine> {
+        self.session_output_cache
+            .get(session_id)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter(|line| {
+                        self.output_filter.matches(line) && self.output_time_filter.matches(line)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn visible_output_lines(&self) -> Vec<&OutputLine> {
+        self.selected_session_id()
+            .map(|session_id| self.visible_output_lines_for_session(session_id))
+            .unwrap_or_default()
+    }
+
+    fn visible_timeline_lines(&self) -> Vec<Line<'static>> {
+        let show_session_label = self.timeline_scope == SearchScope::AllSessions;
+        self.timeline_events()
+            .into_iter()
+            .filter(|event| self.timeline_event_filter.matches(event.event_type))
+            .filter(|event| self.output_time_filter.matches_timestamp(event.occurred_at))
+            .map(|event| {
+                let prefix = if show_session_label {
+                    format!("{} ", format_session_id(&event.session_id))
+                } else {
+                    String::new()
+                };
+                Line::from(format!(
+                    "[{}] {}{:<11} {}",
+                    event.occurred_at.format("%H:%M:%S"),
+                    prefix,
+                    event.event_type.label(),
+                    event.summary
+                ))
+            })
+            .collect()
+    }
+
+    fn timeline_events(&self) -> Vec<TimelineEvent> {
+        let mut events = match self.timeline_scope {
+            SearchScope::SelectedSession => self
+                .sessions
+                .get(self.selected_session)
+                .map(|session| self.session_timeline_events(session))
+                .unwrap_or_default(),
+            SearchScope::AllSessions => self
+                .sessions
+                .iter()
+                .flat_map(|session| self.session_timeline_events(session))
+                .collect(),
+        };
+        events.sort_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+                .then_with(|| left.summary.cmp(&right.summary))
+        });
+        events
+    }
+
+    fn session_timeline_events(&self, session: &Session) -> Vec<TimelineEvent> {
+        let mut events = vec![TimelineEvent {
+            occurred_at: session.created_at,
+            session_id: session.id.clone(),
+            event_type: TimelineEventType::Lifecycle,
+            summary: format!(
+                "created session as {} for {}",
+                session.agent_type,
+                truncate_for_dashboard(&session.task, 64)
+            ),
+        }];
+
+        if session.updated_at > session.created_at {
+            events.push(TimelineEvent {
+                occurred_at: session.updated_at,
+                session_id: session.id.clone(),
+                event_type: TimelineEventType::Lifecycle,
+                summary: format!("state {} | updated session metadata", session.state),
+            });
+        }
+
+        if let Some(worktree) = session.worktree.as_ref() {
+            events.push(TimelineEvent {
+                occurred_at: session.updated_at,
+                session_id: session.id.clone(),
+                event_type: TimelineEventType::Lifecycle,
+                summary: format!(
+                    "attached worktree {} from {}",
+                    worktree.branch, worktree.base_branch
+                ),
+            });
+        }
+
+        if session.metrics.files_changed > 0 {
+            events.push(TimelineEvent {
+                occurred_at: session.updated_at,
+                session_id: session.id.clone(),
+                event_type: TimelineEventType::FileChange,
+                summary: format!("files changed {}", session.metrics.files_changed),
+            });
+        }
+
+        let messages = self
+            .db
+            .list_messages_for_session(&session.id, 128)
+            .unwrap_or_default();
+        events.extend(messages.into_iter().map(|message| {
+            let (direction, counterpart) = if message.from_session == session.id {
+                ("sent", format_session_id(&message.to_session))
+            } else {
+                ("received", format_session_id(&message.from_session))
+            };
+            TimelineEvent {
+                occurred_at: message.timestamp,
+                session_id: session.id.clone(),
+                event_type: TimelineEventType::Message,
+                summary: format!(
+                    "{direction} {} {} | {}",
+                    message.msg_type,
+                    counterpart,
+                    truncate_for_dashboard(
+                        &comms::preview(&message.msg_type, &message.content),
+                        64
+                    )
+                ),
+            }
+        }));
+
+        let tool_logs = self
+            .db
+            .query_tool_logs(&session.id, 1, 128)
+            .map(|page| page.entries)
+            .unwrap_or_default();
+        events.extend(tool_logs.into_iter().filter_map(|entry| {
+            parse_rfc3339_to_utc(&entry.timestamp).map(|occurred_at| TimelineEvent {
+                occurred_at,
+                session_id: session.id.clone(),
+                event_type: TimelineEventType::ToolCall,
+                summary: format!(
+                    "tool {} | {}ms | {}",
+                    entry.tool_name,
+                    entry.duration_ms,
+                    truncate_for_dashboard(&entry.input_summary, 56)
+                ),
+            })
+        }));
+        events
+    }
+
+    fn recompute_search_matches(&mut self) {
+        let Some(query) = self.search_query.clone() else {
+            self.search_matches.clear();
+            self.selected_search_match = 0;
+            return;
+        };
+
+        let Ok(regex) = compile_search_regex(&query) else {
+            self.search_matches.clear();
+            self.selected_search_match = 0;
+            return;
+        };
+
+        self.search_matches = self
+            .search_target_session_ids()
+            .into_iter()
+            .flat_map(|session_id| {
+                self.visible_output_lines_for_session(session_id)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, line)| {
+                        regex.is_match(&line.text).then_some(SearchMatch {
+                            session_id: session_id.to_string(),
+                            line_index: index,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        if self.search_matches.is_empty() {
+            self.selected_search_match = 0;
+            return;
+        }
+
+        self.selected_search_match = self
+            .selected_search_match
+            .min(self.search_matches.len().saturating_sub(1));
+        self.focus_selected_search_match();
+    }
+
+    fn focus_selected_search_match(&mut self) {
+        let Some(search_match) = self.search_matches.get(self.selected_search_match).cloned()
+        else {
+            return;
+        };
+
+        if self.selected_session_id() != Some(search_match.session_id.as_str()) {
+            self.sync_selection_by_id(Some(&search_match.session_id));
+            self.sync_selected_output();
+            self.sync_selected_diff();
+            self.sync_selected_messages();
+            self.sync_selected_lineage();
+            self.refresh_logs();
+        }
+
+        self.output_follow = false;
+        let viewport_height = self.last_output_height.max(1);
+        let offset = search_match
+            .line_index
+            .saturating_sub(viewport_height.saturating_sub(1) / 2);
+        self.output_scroll_offset = offset.min(self.max_output_scroll());
+    }
+
+    fn search_navigation_note(&self) -> String {
+        let query = self.search_query.as_deref().unwrap_or_default();
+        let total = self.search_matches.len();
+        let current = if total == 0 {
+            0
+        } else {
+            self.selected_search_match.min(total.saturating_sub(1)) + 1
+        };
+
+        format!(
+            "search /{query} match {current}/{total} | {}",
+            self.search_scope.label()
+        )
+    }
+
+    fn search_match_session_count(&self) -> usize {
+        self.search_matches
+            .iter()
+            .map(|search_match| search_match.session_id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    fn search_target_session_ids(&self) -> Vec<&str> {
+        let selected_session_id = self.selected_session_id();
+        let selected_agent_type = self.selected_agent_type();
+
+        self.sessions
+            .iter()
+            .filter(|session| {
+                self.search_scope
+                    .matches(selected_session_id, session.id.as_str())
+                    && self
+                        .search_agent_filter
+                        .matches(selected_agent_type, session.agent_type.as_str())
+            })
+            .map(|session| session.id.as_str())
+            .collect()
+    }
+
+    fn next_approval_target_session_id(&self) -> Option<String> {
+        let pending_items: usize = self.approval_queue_counts.values().sum();
+        if pending_items == 0 {
+            return None;
+        }
+
+        let active_session_ids: HashSet<_> =
+            self.sessions.iter().map(|session| &session.id).collect();
+        let queue = self.db.unread_approval_queue(pending_items).ok()?;
+        let mut seen = HashSet::new();
+        let ordered_targets = queue
+            .into_iter()
+            .filter_map(|message| {
+                if active_session_ids.contains(&message.to_session)
+                    && seen.insert(message.to_session.clone())
+                {
+                    Some(message.to_session)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if ordered_targets.is_empty() {
+            return None;
+        }
+
+        let current_session_id = self.selected_session_id();
+        current_session_id
+            .and_then(|session_id| {
+                ordered_targets
+                    .iter()
+                    .position(|target_session_id| target_session_id == session_id)
+                    .map(|index| ordered_targets[(index + 1) % ordered_targets.len()].clone())
+            })
+            .or_else(|| ordered_targets.first().cloned())
+    }
+
     fn sync_output_scroll(&mut self, viewport_height: usize) {
         self.last_output_height = viewport_height.max(1);
         let max_scroll = self.max_output_scroll();
@@ -1844,14 +3651,170 @@ impl Dashboard {
     }
 
     fn max_output_scroll(&self) -> usize {
-        self.selected_output_lines()
+        self.visible_output_lines()
             .len()
             .saturating_sub(self.last_output_height.max(1))
+    }
+
+    fn sync_metrics_scroll(&mut self, viewport_height: usize) {
+        self.last_metrics_height = viewport_height.max(1);
+        let max_scroll = self.max_metrics_scroll();
+        self.metrics_scroll_offset = self.metrics_scroll_offset.min(max_scroll);
+    }
+
+    fn max_metrics_scroll(&self) -> usize {
+        self.selected_session_metrics_text()
+            .lines()
+            .count()
+            .saturating_sub(self.last_metrics_height.max(1))
+    }
+
+    fn focused_delegate_index(&self) -> Option<usize> {
+        if self.selected_child_sessions.is_empty() {
+            return None;
+        }
+
+        self.focused_delegate_session_id
+            .as_deref()
+            .and_then(|session_id| {
+                self.selected_child_sessions
+                    .iter()
+                    .position(|delegate| delegate.session_id == session_id)
+            })
+            .or(Some(0))
+    }
+
+    fn set_focused_delegate_by_index(&mut self, index: usize) {
+        let Some(delegate) = self.selected_child_sessions.get(index) else {
+            return;
+        };
+        let delegate_session_id = delegate.session_id.clone();
+
+        self.focused_delegate_session_id = Some(delegate_session_id.clone());
+        self.ensure_focused_delegate_visible();
+        self.set_operator_note(format!(
+            "focused delegate {}",
+            format_session_id(&delegate_session_id)
+        ));
+    }
+
+    fn sync_focused_delegate_selection(&mut self) {
+        self.focused_delegate_session_id = self
+            .focused_delegate_index()
+            .and_then(|index| self.selected_child_sessions.get(index))
+            .map(|delegate| delegate.session_id.clone());
+        self.ensure_focused_delegate_visible();
+    }
+
+    fn ensure_focused_delegate_visible(&mut self) {
+        let Some(delegate_index) = self.focused_delegate_index() else {
+            return;
+        };
+        let Some(line_index) = self.delegate_metrics_line_index(delegate_index) else {
+            return;
+        };
+
+        let viewport_height = self.last_metrics_height.max(1);
+        if line_index < self.metrics_scroll_offset {
+            self.metrics_scroll_offset = line_index;
+        } else if line_index >= self.metrics_scroll_offset + viewport_height {
+            self.metrics_scroll_offset =
+                line_index.saturating_sub(viewport_height.saturating_sub(1));
+        }
+        self.metrics_scroll_offset = self.metrics_scroll_offset.min(self.max_metrics_scroll());
+    }
+
+    fn delegate_metrics_line_index(&self, target_index: usize) -> Option<usize> {
+        if target_index >= self.selected_child_sessions.len() {
+            return None;
+        }
+
+        let mut line_index = self.metrics_line_count_before_delegates();
+        for delegate in self.selected_child_sessions.iter().take(target_index) {
+            line_index += 1;
+            if delegate.last_output_preview.is_some() {
+                line_index += 1;
+            }
+        }
+
+        Some(line_index)
+    }
+
+    fn metrics_line_count_before_delegates(&self) -> usize {
+        if self.sessions.get(self.selected_session).is_none() {
+            return 0;
+        }
+
+        let mut line_count = 2;
+        if self.selected_parent_session.is_some() {
+            line_count += 1;
+        }
+        if self.selected_team_summary.is_some() {
+            line_count += 1;
+        }
+        line_count += 1;
+        line_count += 1;
+
+        let stabilized = self.daemon_activity.stabilized_after_recovery_at();
+        if self.daemon_activity.chronic_saturation_streak > 0 {
+            line_count += 1;
+        }
+        if self.daemon_activity.operator_escalation_required() {
+            line_count += 1;
+        }
+        if self
+            .daemon_activity
+            .chronic_saturation_cleared_at()
+            .is_some()
+        {
+            line_count += 1;
+        }
+        if stabilized.is_some() {
+            line_count += 1;
+        }
+        if self.daemon_activity.last_dispatch_at.is_some() {
+            line_count += 1;
+        }
+        if stabilized.is_none() {
+            if self.daemon_activity.last_recovery_dispatch_at.is_some() {
+                line_count += 1;
+            }
+            if self.daemon_activity.last_rebalance_at.is_some() {
+                line_count += 1;
+            }
+        }
+        if self.daemon_activity.last_auto_merge_at.is_some() {
+            line_count += 1;
+        }
+        if self.daemon_activity.last_auto_prune_at.is_some() {
+            line_count += 1;
+        }
+        if self.selected_route_preview.is_some() {
+            line_count += 1;
+        }
+        if !self.selected_child_sessions.is_empty() {
+            line_count += 1;
+        }
+
+        line_count
+    }
+
+    #[cfg(test)]
+    fn visible_output_text(&self) -> String {
+        self.visible_output_lines()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn reset_output_view(&mut self) {
         self.output_follow = true;
         self.output_scroll_offset = 0;
+    }
+
+    fn reset_metrics_view(&mut self) {
+        self.metrics_scroll_offset = 0;
     }
 
     fn refresh_logs(&mut self) {
@@ -1870,6 +3833,7 @@ impl Dashboard {
     }
 
     fn aggregate_usage(&self) -> AggregateUsage {
+        let thresholds = self.cfg.effective_budget_alert_thresholds();
         let total_tokens = self
             .sessions
             .iter()
@@ -1880,8 +3844,12 @@ impl Dashboard {
             .iter()
             .map(|session| session.metrics.cost_usd)
             .sum::<f64>();
-        let token_state = budget_state(total_tokens as f64, self.cfg.token_budget as f64);
-        let cost_state = budget_state(total_cost_usd, self.cfg.cost_budget_usd);
+        let token_state = budget_state(
+            total_tokens as f64,
+            self.cfg.token_budget as f64,
+            thresholds,
+        );
+        let cost_state = budget_state(total_cost_usd, self.cfg.cost_budget_usd, thresholds);
 
         AggregateUsage {
             total_tokens,
@@ -2045,12 +4013,41 @@ impl Dashboard {
             if !self.selected_child_sessions.is_empty() {
                 lines.push("Delegates".to_string());
                 for child in &self.selected_child_sessions {
-                    lines.push(format!(
-                        "- {} [{}] | backlog {}",
+                    let mut child_line = format!(
+                        "{} {} [{}] | next {}",
+                        if self.focused_delegate_session_id.as_deref()
+                            == Some(child.session_id.as_str())
+                        {
+                            ">>"
+                        } else {
+                            "-"
+                        },
                         format_session_id(&child.session_id),
                         session_state_label(&child.state),
-                        child.handoff_backlog
+                        delegate_next_action(child)
+                    );
+                    if let Some(worktree_health) = child.worktree_health {
+                        child_line.push_str(&format!(
+                            " | worktree {}",
+                            delegate_worktree_health_label(worktree_health)
+                        ));
+                    }
+                    child_line.push_str(&format!(
+                        " | approvals {} | backlog {} | progress {} tok / {} files / {} | task {}",
+                        child.approval_backlog,
+                        child.handoff_backlog,
+                        format_token_count(child.tokens_used),
+                        child.files_changed,
+                        format_duration(child.duration_secs),
+                        child.task_preview
                     ));
+                    if let Some(branch) = child.branch.as_ref() {
+                        child_line.push_str(&format!(" | branch {branch}"));
+                    }
+                    lines.push(child_line);
+                    if let Some(last_output_preview) = child.last_output_preview.as_ref() {
+                        lines.push(format!("  last output {last_output_preview}"));
+                    }
                 }
             }
 
@@ -2078,10 +4075,14 @@ impl Dashboard {
             }
 
             lines.push(format!(
-                "Tokens {} | Tools {} | Files {}",
+                "Tokens {} total | In {} | Out {}",
                 format_token_count(metrics.tokens_used),
-                metrics.tool_calls,
-                metrics.files_changed,
+                format_token_count(metrics.input_tokens),
+                format_token_count(metrics.output_tokens),
+            ));
+            lines.push(format!(
+                "Tools {} | Files {}",
+                metrics.tool_calls, metrics.files_changed,
             ));
             lines.push(format!(
                 "Cost ${:.4} | Duration {}s",
@@ -2135,6 +4136,7 @@ impl Dashboard {
 
     fn aggregate_cost_summary(&self) -> (String, Style) {
         let aggregate = self.aggregate_usage();
+        let thresholds = self.cfg.effective_budget_alert_thresholds();
         let mut text = if self.cfg.cost_budget_usd > 0.0 {
             format!(
                 "Aggregate cost {} / {}",
@@ -2148,10 +4150,9 @@ impl Dashboard {
             )
         };
 
-        match aggregate.overall_state {
-            BudgetState::Warning => text.push_str(" | Budget warning"),
-            BudgetState::OverBudget => text.push_str(" | Budget exceeded"),
-            _ => {}
+        if let Some(summary_suffix) = aggregate.overall_state.summary_suffix(thresholds) {
+            text.push_str(" | ");
+            text.push_str(&summary_suffix);
         }
 
         (text, aggregate.overall_state.style())
@@ -2226,6 +4227,18 @@ impl Dashboard {
             .count()
     }
 
+    fn refresh_after_spawn(&mut self, select_session_id: Option<&str>) {
+        self.refresh();
+        self.sync_selection_by_id(select_session_id);
+        self.reset_output_view();
+        self.reset_metrics_view();
+        self.sync_selected_output();
+        self.sync_selected_diff();
+        self.sync_selected_messages();
+        self.sync_selected_lineage();
+        self.refresh_logs();
+    }
+
     fn new_session_task(&self) -> String {
         self.sessions
             .get(self.selected_session)
@@ -2239,67 +4252,102 @@ impl Dashboard {
             .unwrap_or_else(|| "New ECC 2.0 session".to_string())
     }
 
+    fn spawn_prompt_seed(&self) -> String {
+        format!("give me 2 agents working on {}", self.new_session_task())
+    }
+
+    fn build_spawn_plan(&self, input: &str) -> Result<SpawnPlan, String> {
+        let request = parse_spawn_request(input)?;
+        let available_slots = self
+            .cfg
+            .max_parallel_sessions
+            .saturating_sub(self.active_session_count());
+
+        if available_slots == 0 {
+            return Err(format!(
+                "cannot queue sessions: active session limit reached ({})",
+                self.cfg.max_parallel_sessions
+            ));
+        }
+
+        Ok(SpawnPlan {
+            requested_count: request.requested_count,
+            spawn_count: request.requested_count.min(available_slots),
+            task: request.task,
+        })
+    }
+
     fn pane_areas(&self, area: Rect) -> PaneAreas {
+        let detail_panes = self.visible_detail_panes();
         match self.cfg.pane_layout {
             PaneLayout::Horizontal => {
                 let columns = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints(self.primary_constraints())
                     .split(area);
-                let right_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(OUTPUT_PANE_PERCENT),
-                        Constraint::Percentage(100 - OUTPUT_PANE_PERCENT),
-                    ])
-                    .split(columns[1]);
-
-                PaneAreas {
+                let mut pane_areas = PaneAreas {
                     sessions: columns[0],
-                    output: right_rows[0],
-                    metrics: right_rows[1],
+                    output: None,
+                    metrics: None,
                     log: None,
+                };
+                for (pane, rect) in horizontal_detail_layout(columns[1], &detail_panes) {
+                    pane_areas.assign(pane, rect);
                 }
+                pane_areas
             }
             PaneLayout::Vertical => {
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints(self.primary_constraints())
                     .split(area);
-                let bottom_columns = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(OUTPUT_PANE_PERCENT),
-                        Constraint::Percentage(100 - OUTPUT_PANE_PERCENT),
-                    ])
-                    .split(rows[1]);
-
-                PaneAreas {
+                let mut pane_areas = PaneAreas {
                     sessions: rows[0],
-                    output: bottom_columns[0],
-                    metrics: bottom_columns[1],
+                    output: None,
+                    metrics: None,
                     log: None,
+                };
+                for (pane, rect) in vertical_detail_layout(rows[1], &detail_panes) {
+                    pane_areas.assign(pane, rect);
                 }
+                pane_areas
             }
             PaneLayout::Grid => {
-                let rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints(self.primary_constraints())
-                    .split(area);
-                let top_columns = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints(self.primary_constraints())
-                    .split(rows[0]);
-                let bottom_columns = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints(self.primary_constraints())
-                    .split(rows[1]);
+                if detail_panes.len() < 3 {
+                    let columns = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints(self.primary_constraints())
+                        .split(area);
+                    let mut pane_areas = PaneAreas {
+                        sessions: columns[0],
+                        output: None,
+                        metrics: None,
+                        log: None,
+                    };
+                    for (pane, rect) in horizontal_detail_layout(columns[1], &detail_panes) {
+                        pane_areas.assign(pane, rect);
+                    }
+                    pane_areas
+                } else {
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints(self.primary_constraints())
+                        .split(area);
+                    let top_columns = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints(self.primary_constraints())
+                        .split(rows[0]);
+                    let bottom_columns = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints(self.primary_constraints())
+                        .split(rows[1]);
 
-                PaneAreas {
-                    sessions: top_columns[0],
-                    output: top_columns[1],
-                    metrics: bottom_columns[0],
-                    log: Some(bottom_columns[1]),
+                    PaneAreas {
+                        sessions: top_columns[0],
+                        output: Some(top_columns[1]),
+                        metrics: Some(bottom_columns[0]),
+                        log: Some(bottom_columns[1]),
+                    }
                 }
             }
         }
@@ -2312,11 +4360,25 @@ impl Dashboard {
         ]
     }
 
-    fn visible_panes(&self) -> &'static [Pane] {
+    fn visible_panes(&self) -> Vec<Pane> {
+        self.layout_panes()
+            .into_iter()
+            .filter(|pane| !self.collapsed_panes.contains(pane))
+            .collect()
+    }
+
+    fn visible_detail_panes(&self) -> Vec<Pane> {
+        self.visible_panes()
+            .into_iter()
+            .filter(|pane| *pane != Pane::Sessions)
+            .collect()
+    }
+
+    fn layout_panes(&self) -> Vec<Pane> {
         match self.cfg.pane_layout {
-            PaneLayout::Grid => &[Pane::Sessions, Pane::Output, Pane::Metrics, Pane::Log],
+            PaneLayout::Grid => vec![Pane::Sessions, Pane::Output, Pane::Metrics, Pane::Log],
             PaneLayout::Horizontal | PaneLayout::Vertical => {
-                &[Pane::Sessions, Pane::Output, Pane::Metrics]
+                vec![Pane::Sessions, Pane::Output, Pane::Metrics]
             }
         }
     }
@@ -2330,7 +4392,7 @@ impl Dashboard {
 
     fn pane_border_style(&self, pane: Pane) -> Style {
         if self.selected_pane == pane {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(self.theme_palette().accent)
         } else {
             Style::default()
         }
@@ -2341,6 +4403,30 @@ impl Dashboard {
             PaneLayout::Horizontal => "horizontal",
             PaneLayout::Vertical => "vertical",
             PaneLayout::Grid => "grid",
+        }
+    }
+
+    fn theme_label(&self) -> &'static str {
+        match self.cfg.theme {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+        }
+    }
+
+    fn theme_palette(&self) -> ThemePalette {
+        match self.cfg.theme {
+            Theme::Dark => ThemePalette {
+                accent: Color::Cyan,
+                row_highlight_bg: Color::DarkGray,
+                muted: Color::DarkGray,
+                help_border: Color::Yellow,
+            },
+            Theme::Light => ThemePalette {
+                accent: Color::Blue,
+                row_highlight_bg: Color::Gray,
+                muted: Color::Black,
+                help_border: Color::Blue,
+            },
         }
     }
 
@@ -2397,6 +4483,417 @@ impl Pane {
             Pane::Log => "Log",
         }
     }
+
+    fn from_shortcut(slot: usize) -> Option<Self> {
+        match slot {
+            1 => Some(Self::Sessions),
+            2 => Some(Self::Output),
+            3 => Some(Self::Metrics),
+            4 => Some(Self::Log),
+            _ => None,
+        }
+    }
+
+    fn sort_key(self) -> u8 {
+        match self {
+            Self::Sessions => 1,
+            Self::Output => 2,
+            Self::Metrics => 3,
+            Self::Log => 4,
+        }
+    }
+}
+
+fn pane_rect(pane_areas: &PaneAreas, pane: Pane) -> Option<Rect> {
+    match pane {
+        Pane::Sessions => Some(pane_areas.sessions),
+        Pane::Output => pane_areas.output,
+        Pane::Metrics => pane_areas.metrics,
+        Pane::Log => pane_areas.log,
+    }
+}
+
+fn pane_center(rect: Rect) -> (i16, i16) {
+    (
+        rect.x as i16 + rect.width as i16 / 2,
+        rect.y as i16 + rect.height as i16 / 2,
+    )
+}
+
+impl OutputFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::ErrorsOnly,
+            Self::ErrorsOnly => Self::ToolCallsOnly,
+            Self::ToolCallsOnly => Self::FileChangesOnly,
+            Self::FileChangesOnly => Self::All,
+        }
+    }
+
+    fn matches(self, line: &OutputLine) -> bool {
+        match self {
+            OutputFilter::All => true,
+            OutputFilter::ErrorsOnly => line.stream == OutputStream::Stderr,
+            OutputFilter::ToolCallsOnly => looks_like_tool_call(&line.text),
+            OutputFilter::FileChangesOnly => looks_like_file_change(&line.text),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            OutputFilter::All => "all",
+            OutputFilter::ErrorsOnly => "errors",
+            OutputFilter::ToolCallsOnly => "tool calls",
+            OutputFilter::FileChangesOnly => "file changes",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            OutputFilter::All => "",
+            OutputFilter::ErrorsOnly => " errors",
+            OutputFilter::ToolCallsOnly => " tool calls",
+            OutputFilter::FileChangesOnly => " file changes",
+        }
+    }
+}
+
+fn looks_like_tool_call(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    const TOOL_PREFIXES: &[&str] = &[
+        "tool ",
+        "tool:",
+        "[tool",
+        "tool call",
+        "calling tool",
+        "running tool",
+        "invoking tool",
+        "using tool",
+        "read(",
+        "write(",
+        "edit(",
+        "multi_edit(",
+        "bash(",
+        "grep(",
+        "glob(",
+        "search(",
+        "ls(",
+        "apply_patch(",
+    ];
+
+    TOOL_PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+}
+
+fn parse_spawn_request(input: &str) -> Result<SpawnRequest, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("spawn request cannot be empty".to_string());
+    }
+
+    let count = Regex::new(r"\b([1-9]\d*)\b")
+        .expect("spawn count regex")
+        .captures(trimmed)
+        .and_then(|captures| captures.get(1))
+        .and_then(|count| count.as_str().parse::<usize>().ok())
+        .unwrap_or(1);
+
+    let task = extract_spawn_task(trimmed);
+    if task.is_empty() {
+        return Err("spawn request must include a task description".to_string());
+    }
+
+    Ok(SpawnRequest {
+        requested_count: count,
+        task,
+    })
+}
+
+fn extract_spawn_task(input: &str) -> String {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    for marker in ["working on ", "work on ", "for ", ":"] {
+        if let Some(start) = lower.find(marker) {
+            let task = trimmed[start + marker.len()..]
+                .trim_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '-');
+            if !task.is_empty() {
+                return task.to_string();
+            }
+        }
+    }
+
+    let stripped =
+        Regex::new(r"(?i)^\s*(give me|spawn|queue|start|launch)\s+\d+\s+(agents?|sessions?)\s*")
+            .expect("spawn command regex")
+            .replace(trimmed, "");
+    let stripped = stripped.trim_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '-');
+    if !stripped.is_empty() && stripped != trimmed {
+        return stripped.to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn expand_spawn_tasks(task: &str, count: usize) -> Vec<String> {
+    if count <= 1 {
+        return vec![task.to_string()];
+    }
+
+    (0..count)
+        .map(|index| format!("{task} [{}/{}]", index + 1, count))
+        .collect()
+}
+
+fn build_spawn_note(plan: &SpawnPlan, created_count: usize) -> String {
+    let task = truncate_for_dashboard(&plan.task, 72);
+    if plan.spawn_count < plan.requested_count {
+        format!(
+            "spawned {created_count} session(s) for {task} (requested {}, capped at {})",
+            plan.requested_count, plan.spawn_count
+        )
+    } else {
+        format!("spawned {created_count} session(s) for {task}")
+    }
+}
+
+fn post_spawn_selection_id(
+    source_session_id: Option<&str>,
+    created_ids: &[String],
+) -> Option<String> {
+    if created_ids.len() > 1 {
+        source_session_id
+            .map(ToOwned::to_owned)
+            .or_else(|| created_ids.first().cloned())
+    } else {
+        created_ids.first().cloned()
+    }
+}
+
+fn looks_like_file_change(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    if lower.contains("applied patch")
+        || lower.contains("patch applied")
+        || lower.starts_with("diff --git ")
+    {
+        return true;
+    }
+
+    const FILE_CHANGE_VERBS: &[&str] = &[
+        "updated ",
+        "created ",
+        "deleted ",
+        "renamed ",
+        "modified ",
+        "wrote ",
+        "editing ",
+        "edited ",
+        "writing ",
+    ];
+
+    FILE_CHANGE_VERBS
+        .iter()
+        .any(|prefix| lower.starts_with(prefix) && contains_path_like_token(text))
+}
+
+fn contains_path_like_token(text: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        let trimmed = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '[' | ']' | '(' | ')' | '{' | '}' | ',' | ':' | ';' | '"' | '\''
+            )
+        });
+
+        trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.starts_with("./")
+            || trimmed.starts_with("../")
+            || trimmed
+                .rsplit_once('.')
+                .map(|(stem, ext)| {
+                    !stem.is_empty()
+                        && !ext.is_empty()
+                        && ext.len() <= 10
+                        && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+                })
+                .unwrap_or(false)
+    })
+}
+
+impl OutputTimeFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::AllTime => Self::Last15Minutes,
+            Self::Last15Minutes => Self::LastHour,
+            Self::LastHour => Self::Last24Hours,
+            Self::Last24Hours => Self::AllTime,
+        }
+    }
+
+    fn matches(self, line: &OutputLine) -> bool {
+        match self {
+            Self::AllTime => true,
+            Self::Last15Minutes => line
+                .occurred_at()
+                .map(|timestamp| self.matches_timestamp(timestamp))
+                .unwrap_or(false),
+            Self::LastHour => line
+                .occurred_at()
+                .map(|timestamp| self.matches_timestamp(timestamp))
+                .unwrap_or(false),
+            Self::Last24Hours => line
+                .occurred_at()
+                .map(|timestamp| self.matches_timestamp(timestamp))
+                .unwrap_or(false),
+        }
+    }
+
+    fn matches_timestamp(self, timestamp: chrono::DateTime<Utc>) -> bool {
+        match self {
+            Self::AllTime => true,
+            Self::Last15Minutes => timestamp >= Utc::now() - Duration::minutes(15),
+            Self::LastHour => timestamp >= Utc::now() - Duration::hours(1),
+            Self::Last24Hours => timestamp >= Utc::now() - Duration::hours(24),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AllTime => "all time",
+            Self::Last15Minutes => "last 15m",
+            Self::LastHour => "last 1h",
+            Self::Last24Hours => "last 24h",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::AllTime => "",
+            Self::Last15Minutes => " last 15m",
+            Self::LastHour => " last 1h",
+            Self::Last24Hours => " last 24h",
+        }
+    }
+}
+
+impl TimelineEventFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Lifecycle,
+            Self::Lifecycle => Self::Messages,
+            Self::Messages => Self::ToolCalls,
+            Self::ToolCalls => Self::FileChanges,
+            Self::FileChanges => Self::All,
+        }
+    }
+
+    fn matches(self, event_type: TimelineEventType) -> bool {
+        match self {
+            Self::All => true,
+            Self::Lifecycle => event_type == TimelineEventType::Lifecycle,
+            Self::Messages => event_type == TimelineEventType::Message,
+            Self::ToolCalls => event_type == TimelineEventType::ToolCall,
+            Self::FileChanges => event_type == TimelineEventType::FileChange,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all events",
+            Self::Lifecycle => "lifecycle",
+            Self::Messages => "messages",
+            Self::ToolCalls => "tool calls",
+            Self::FileChanges => "file changes",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Lifecycle => " lifecycle",
+            Self::Messages => " messages",
+            Self::ToolCalls => " tool calls",
+            Self::FileChanges => " file changes",
+        }
+    }
+}
+
+impl TimelineEventType {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lifecycle => "lifecycle",
+            Self::Message => "message",
+            Self::ToolCall => "tool",
+            Self::FileChange => "file-change",
+        }
+    }
+}
+
+fn parse_rfc3339_to_utc(value: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+impl SearchScope {
+    fn next(self) -> Self {
+        match self {
+            Self::SelectedSession => Self::AllSessions,
+            Self::AllSessions => Self::SelectedSession,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SelectedSession => "selected session",
+            Self::AllSessions => "all sessions",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::SelectedSession => "",
+            Self::AllSessions => " all sessions",
+        }
+    }
+
+    fn matches(self, selected_session_id: Option<&str>, session_id: &str) -> bool {
+        match self {
+            Self::SelectedSession => selected_session_id == Some(session_id),
+            Self::AllSessions => true,
+        }
+    }
+}
+
+impl SearchAgentFilter {
+    fn matches(self, selected_agent_type: Option<&str>, session_agent_type: &str) -> bool {
+        match self {
+            Self::AllAgents => true,
+            Self::SelectedAgentType => selected_agent_type == Some(session_agent_type),
+        }
+    }
+
+    fn label(self, selected_agent_type: &str) -> String {
+        match self {
+            Self::AllAgents => "all agents".to_string(),
+            Self::SelectedAgentType => format!("agent {}", selected_agent_type),
+        }
+    }
+
+    fn title_suffix(self, selected_agent_type: &str) -> String {
+        match self {
+            Self::AllAgents => String::new(),
+            Self::SelectedAgentType => format!(" {}", self.label(selected_agent_type)),
+        }
+    }
 }
 
 impl SessionSummary {
@@ -2448,7 +4945,11 @@ impl SessionSummary {
     }
 }
 
-fn session_row(session: &Session, unread_messages: usize) -> Row<'static> {
+fn session_row(
+    session: &Session,
+    approval_requests: usize,
+    unread_messages: usize,
+) -> Row<'static> {
     Row::new(vec![
         Cell::from(format_session_id(&session.id)),
         Cell::from(session.agent_type.clone()),
@@ -2458,6 +4959,18 @@ fn session_row(session: &Session, unread_messages: usize) -> Row<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Cell::from(session_branch(session)),
+        Cell::from(if approval_requests == 0 {
+            "-".to_string()
+        } else {
+            approval_requests.to_string()
+        })
+        .style(if approval_requests == 0 {
+            Style::default()
+        } else {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        }),
         Cell::from(if unread_messages == 0 {
             "-".to_string()
         } else {
@@ -2471,6 +4984,8 @@ fn session_row(session: &Session, unread_messages: usize) -> Row<'static> {
                 .add_modifier(Modifier::BOLD)
         }),
         Cell::from(session.metrics.tokens_used.to_string()),
+        Cell::from(session.metrics.tool_calls.to_string()),
+        Cell::from(session.metrics.files_changed.to_string()),
         Cell::from(format_duration(session.metrics.duration_secs)),
     ])
 }
@@ -2562,6 +5077,49 @@ fn attention_queue_line(summary: &SessionSummary, stabilized: bool) -> Line<'sta
     Line::from(spans)
 }
 
+fn approval_queue_line(approval_queue_counts: &HashMap<String, usize>) -> Line<'static> {
+    let pending_sessions = approval_queue_counts.len();
+    let pending_items: usize = approval_queue_counts.values().sum();
+
+    if pending_items == 0 {
+        return Line::from(vec![
+            Span::styled(
+                "Approval queue clear",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  no unanswered queries or conflicts"),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled(
+            "Approval queue  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        summary_span("Pending", pending_items, Color::Yellow),
+        summary_span("Sessions", pending_sessions, Color::Yellow),
+    ])
+}
+
+fn approval_queue_preview_line(messages: &[SessionMessage]) -> Option<Line<'static>> {
+    let message = messages.first()?;
+    let preview = truncate_for_dashboard(&comms::preview(&message.msg_type, &message.content), 72);
+
+    Some(Line::from(vec![
+        Span::raw("- "),
+        Span::styled(
+            format_session_id(&message.to_session),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::raw(preview),
+    ]))
+}
+
 fn truncate_for_dashboard(value: &str, max_chars: usize) -> String {
     let trimmed = value.trim();
     if trimmed.chars().count() <= max_chars {
@@ -2570,6 +5128,118 @@ fn truncate_for_dashboard(value: &str, max_chars: usize) -> String {
 
     let truncated: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{truncated}…")
+}
+
+fn configured_pane_size(cfg: &Config, layout: PaneLayout) -> u16 {
+    let configured = match layout {
+        PaneLayout::Horizontal | PaneLayout::Vertical => cfg.linear_pane_size_percent,
+        PaneLayout::Grid => cfg.grid_pane_size_percent,
+    };
+
+    configured.clamp(MIN_PANE_SIZE_PERCENT, MAX_PANE_SIZE_PERCENT)
+}
+
+fn recommended_spawn_layout(live_session_count: usize) -> PaneLayout {
+    if live_session_count >= 3 {
+        PaneLayout::Grid
+    } else {
+        PaneLayout::Vertical
+    }
+}
+
+fn pane_layout_name(layout: PaneLayout) -> &'static str {
+    match layout {
+        PaneLayout::Horizontal => "horizontal",
+        PaneLayout::Vertical => "vertical",
+        PaneLayout::Grid => "grid",
+    }
+}
+
+fn horizontal_detail_layout(area: Rect, panes: &[Pane]) -> Vec<(Pane, Rect)> {
+    match panes {
+        [] => Vec::new(),
+        [pane] => vec![(*pane, area)],
+        [first, second] => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(OUTPUT_PANE_PERCENT),
+                    Constraint::Percentage(100 - OUTPUT_PANE_PERCENT),
+                ])
+                .split(area);
+            vec![(*first, rows[0]), (*second, rows[1])]
+        }
+        _ => unreachable!("horizontal layouts support at most two detail panes"),
+    }
+}
+
+fn vertical_detail_layout(area: Rect, panes: &[Pane]) -> Vec<(Pane, Rect)> {
+    match panes {
+        [] => Vec::new(),
+        [pane] => vec![(*pane, area)],
+        [first, second] => {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(OUTPUT_PANE_PERCENT),
+                    Constraint::Percentage(100 - OUTPUT_PANE_PERCENT),
+                ])
+                .split(area);
+            vec![(*first, columns[0]), (*second, columns[1])]
+        }
+        _ => unreachable!("vertical layouts support at most two detail panes"),
+    }
+}
+
+fn compile_search_regex(query: &str) -> Result<Regex, regex::Error> {
+    Regex::new(query)
+}
+
+fn highlight_output_line(
+    text: &str,
+    query: &str,
+    is_current_match: bool,
+    palette: ThemePalette,
+) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(text.to_string());
+    }
+
+    let Ok(regex) = compile_search_regex(query) else {
+        return Line::from(text.to_string());
+    };
+
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for matched in regex.find_iter(text) {
+        let start = matched.start();
+        let end = matched.end();
+
+        if start > cursor {
+            spans.push(Span::raw(text[cursor..start].to_string()));
+        }
+
+        let match_style = if is_current_match {
+            Style::default()
+                .bg(palette.accent)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::Yellow).fg(Color::Black)
+        };
+        spans.push(Span::styled(text[start..end].to_string(), match_style));
+        cursor = end;
+    }
+
+    if cursor < text.len() {
+        spans.push(Span::raw(text[cursor..].to_string()));
+    }
+
+    if spans.is_empty() {
+        Line::from(text.to_string())
+    } else {
+        Line::from(spans)
+    }
 }
 
 fn build_worktree_diff_columns(patch: &str) -> WorktreeDiffColumns {
@@ -2650,6 +5320,20 @@ fn session_state_color(state: &SessionState) -> Color {
     }
 }
 
+fn budget_auto_pause_note(outcome: &manager::BudgetEnforcementOutcome) -> String {
+    let cause = match (outcome.token_budget_exceeded, outcome.cost_budget_exceeded) {
+        (true, true) => "token and cost budgets exceeded",
+        (true, false) => "token budget exceeded",
+        (false, true) => "cost budget exceeded",
+        (false, false) => "budget exceeded",
+    };
+
+    format!(
+        "{cause} | auto-paused {} active session(s)",
+        outcome.paused_sessions.len()
+    )
+}
+
 fn format_session_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
@@ -2706,6 +5390,65 @@ fn assignment_action_label(action: manager::AssignmentAction) -> &'static str {
     }
 }
 
+fn delegate_worktree_health_label(health: worktree::WorktreeHealth) -> &'static str {
+    match health {
+        worktree::WorktreeHealth::Clear => "clear",
+        worktree::WorktreeHealth::InProgress => "in progress",
+        worktree::WorktreeHealth::Conflicted => "conflicted",
+    }
+}
+
+fn delegate_next_action(delegate: &DelegatedChildSummary) -> &'static str {
+    if delegate.worktree_health == Some(worktree::WorktreeHealth::Conflicted) {
+        return "resolve conflict";
+    }
+    if delegate.approval_backlog > 0 {
+        return "review approvals";
+    }
+    if delegate.handoff_backlog > 0 && delegate.state == SessionState::Idle {
+        return "process handoff";
+    }
+    if delegate.handoff_backlog > 0 {
+        return "drain backlog";
+    }
+    if delegate.worktree_health == Some(worktree::WorktreeHealth::InProgress) {
+        return "finish worktree changes";
+    }
+    match delegate.state {
+        SessionState::Pending => "wait for startup",
+        SessionState::Running => "let it run",
+        SessionState::Idle => "assign next task",
+        SessionState::Failed => "inspect failure",
+        SessionState::Stopped => "resume or reassign",
+        SessionState::Completed => "merge or cleanup",
+    }
+}
+
+fn delegate_attention_priority(delegate: &DelegatedChildSummary) -> u8 {
+    if delegate.worktree_health == Some(worktree::WorktreeHealth::Conflicted) {
+        return 0;
+    }
+    if delegate.approval_backlog > 0 {
+        return 1;
+    }
+    if matches!(delegate.state, SessionState::Failed | SessionState::Stopped) {
+        return 2;
+    }
+    if delegate.handoff_backlog > 0 {
+        return 3;
+    }
+    if delegate.worktree_health == Some(worktree::WorktreeHealth::InProgress) {
+        return 4;
+    }
+    match delegate.state {
+        SessionState::Pending => 5,
+        SessionState::Running => 6,
+        SessionState::Idle => 7,
+        SessionState::Completed => 8,
+        SessionState::Failed | SessionState::Stopped => unreachable!(),
+    }
+}
+
 fn session_branch(session: &Session) -> String {
     session
         .worktree
@@ -2719,6 +5462,17 @@ fn format_duration(duration_secs: u64) -> String {
     let minutes = (duration_secs % 3600) / 60;
     let seconds = duration_secs % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn cost_metrics_signature(path: &std::path::Path) -> Option<(u64, u128)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((metadata.len(), modified))
 }
 
 #[cfg(test)]
@@ -2736,7 +5490,7 @@ mod tests {
 
     #[test]
     fn render_sessions_shows_summary_headers_and_selected_row() {
-        let dashboard = test_dashboard(
+        let mut dashboard = test_dashboard(
             vec![
                 sample_session(
                     "run-12345678",
@@ -2757,15 +5511,241 @@ mod tests {
             ],
             1,
         );
+        dashboard.approval_queue_counts = HashMap::from([(String::from("run-12345678"), 2usize)]);
+        dashboard.approval_queue_preview = vec![SessionMessage {
+            id: 1,
+            from_session: "lead-12345678".to_string(),
+            to_session: "run-12345678".to_string(),
+            content: "{\"question\":\"Need approval to continue\"}".to_string(),
+            msg_type: "query".to_string(),
+            read: false,
+            timestamp: Utc::now(),
+        }];
 
-        let rendered = render_dashboard_text(dashboard, 180, 24);
+        let rendered = render_dashboard_text(dashboard, 220, 24);
         assert!(rendered.contains("ID"));
         assert!(rendered.contains("Branch"));
+        assert!(rendered.contains("Tool Files"));
         assert!(rendered.contains("Total 2"));
         assert!(rendered.contains("Running 1"));
         assert!(rendered.contains("Completed 1"));
-        assert!(rendered.contains("Attention queue clear"));
+        assert!(rendered.contains("Approval queue"));
         assert!(rendered.contains("done-876"));
+    }
+
+    #[test]
+    fn approval_queue_preview_line_uses_target_session_and_preview() {
+        let line = approval_queue_preview_line(&[SessionMessage {
+            id: 1,
+            from_session: "lead-12345678".to_string(),
+            to_session: "run-12345678".to_string(),
+            content: "{\"question\":\"Need approval to continue\"}".to_string(),
+            msg_type: "query".to_string(),
+            read: false,
+            timestamp: Utc::now(),
+        }])
+        .expect("approval preview line");
+
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("run-123"));
+        assert!(rendered.contains("query"));
+    }
+
+    #[test]
+    fn sync_selected_messages_refreshes_approval_queue_after_marking_read() {
+        let sessions = vec![
+            sample_session(
+                "lead-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/lead"),
+                512,
+                42,
+            ),
+            sample_session(
+                "worker-123456",
+                "reviewer",
+                SessionState::Idle,
+                Some("ecc/worker"),
+                64,
+                5,
+            ),
+        ];
+        let mut dashboard = test_dashboard(sessions, 1);
+        for session in &dashboard.sessions {
+            dashboard.db.insert_session(session).unwrap();
+        }
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-123456",
+                "{\"question\":\"Need operator input\"}",
+                "query",
+            )
+            .unwrap();
+        dashboard.unread_message_counts = dashboard.db.unread_message_counts().unwrap();
+
+        dashboard.sync_selected_messages();
+
+        assert_eq!(dashboard.approval_queue_counts.get("worker-123456"), None);
+        assert!(dashboard.approval_queue_preview.is_empty());
+    }
+
+    #[test]
+    fn focus_next_approval_target_selects_oldest_unread_target() {
+        let sessions = vec![
+            sample_session(
+                "lead-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/lead"),
+                512,
+                42,
+            ),
+            sample_session(
+                "worker-a",
+                "reviewer",
+                SessionState::Idle,
+                Some("ecc/worker-a"),
+                64,
+                5,
+            ),
+            sample_session(
+                "worker-b",
+                "reviewer",
+                SessionState::Idle,
+                Some("ecc/worker-b"),
+                64,
+                5,
+            ),
+        ];
+        let mut dashboard = test_dashboard(sessions, 0);
+        for session in &dashboard.sessions {
+            dashboard.db.insert_session(session).unwrap();
+        }
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-b",
+                "{\"question\":\"Need approval on B\"}",
+                "query",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-a",
+                "{\"question\":\"Need approval on A\"}",
+                "query",
+            )
+            .unwrap();
+        dashboard.sync_approval_queue();
+
+        dashboard.focus_next_approval_target();
+
+        assert_eq!(dashboard.selected_session_id(), Some("worker-b"));
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("focused approval target worker-b")
+        );
+    }
+
+    #[test]
+    fn focus_next_approval_target_cycles_distinct_targets() {
+        let sessions = vec![
+            sample_session(
+                "lead-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/lead"),
+                512,
+                42,
+            ),
+            sample_session(
+                "worker-a",
+                "reviewer",
+                SessionState::Idle,
+                Some("ecc/worker-a"),
+                64,
+                5,
+            ),
+            sample_session(
+                "worker-b",
+                "reviewer",
+                SessionState::Idle,
+                Some("ecc/worker-b"),
+                64,
+                5,
+            ),
+        ];
+        let mut dashboard = test_dashboard(sessions, 1);
+        for session in &dashboard.sessions {
+            dashboard.db.insert_session(session).unwrap();
+        }
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-a",
+                "{\"question\":\"Need approval on A\"}",
+                "query",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-a",
+                "{\"question\":\"Need another approval on A\"}",
+                "conflict",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-b",
+                "{\"question\":\"Need approval on B\"}",
+                "query",
+            )
+            .unwrap();
+        dashboard.sync_approval_queue();
+
+        dashboard.focus_next_approval_target();
+
+        assert_eq!(dashboard.selected_session_id(), Some("worker-b"));
+        assert_eq!(dashboard.approval_queue_counts.get("worker-a"), Some(&2));
+        assert_eq!(dashboard.approval_queue_counts.get("worker-b"), None);
+    }
+
+    #[test]
+    fn focus_next_approval_target_reports_clear_queue() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "lead-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/lead"),
+                512,
+                42,
+            )],
+            0,
+        );
+
+        dashboard.focus_next_approval_target();
+
+        assert_eq!(dashboard.selected_session_id(), Some("lead-12345678"));
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("approval queue clear")
+        );
     }
 
     #[test]
@@ -2793,10 +5773,7 @@ mod tests {
         );
         dashboard.session_output_cache.insert(
             "focus-12345678".to_string(),
-            vec![OutputLine {
-                stream: OutputStream::Stdout,
-                text: "last useful output".to_string(),
-            }],
+            vec![test_output_line(OutputStream::Stdout, "last useful output")],
         );
         dashboard.selected_diff_summary = Some("1 file changed, 2 insertions(+)".to_string());
         dashboard.selected_diff_preview = vec![
@@ -2818,6 +5795,7 @@ mod tests {
         assert!(text.contains("- Working ?? notes.txt"));
         assert!(text.contains("Merge blocked by 1 conflict(s): src/main.rs"));
         assert!(text.contains("- conflict src/main.rs"));
+        assert!(text.contains("Tokens 512 total | In 384 | Out 128"));
         assert!(text.contains("Last output last useful output"));
         assert!(text.contains("Needs attention:"));
         assert!(text.contains("Failed failed-8 | Render dashboard rows"));
@@ -2854,6 +5832,236 @@ mod tests {
         assert!(rendered.contains("Additions"));
         assert!(rendered.contains("-old line"));
         assert!(rendered.contains("+new line"));
+    }
+
+    #[test]
+    fn toggle_timeline_mode_renders_selected_session_events() {
+        let now = Utc::now();
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.created_at = now - chrono::Duration::hours(2);
+        session.updated_at = now - chrono::Duration::minutes(5);
+        session.metrics.files_changed = 3;
+
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session).unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "focus-12345678",
+                "{\"question\":\"Need review\"}",
+                "query",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .insert_tool_log(
+                "focus-12345678",
+                "bash",
+                "cargo test -q",
+                "ok",
+                240,
+                0.2,
+                &(now - chrono::Duration::minutes(3)).to_rfc3339(),
+            )
+            .unwrap();
+
+        dashboard.toggle_timeline_mode();
+
+        assert_eq!(dashboard.output_mode, OutputMode::Timeline);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("showing selected session timeline")
+        );
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("Timeline"));
+        assert!(rendered.contains("created session as planner"));
+        assert!(rendered.contains("received query lead-123"));
+        assert!(rendered.contains("tool bash"));
+        assert!(rendered.contains("files changed 3"));
+    }
+
+    #[test]
+    fn cycle_timeline_event_filter_limits_rendered_events() {
+        let now = Utc::now();
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.created_at = now - chrono::Duration::hours(2);
+        session.updated_at = now - chrono::Duration::minutes(5);
+        session.metrics.files_changed = 1;
+
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session).unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "focus-12345678",
+                "{\"question\":\"Need review\"}",
+                "query",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .insert_tool_log(
+                "focus-12345678",
+                "bash",
+                "cargo test -q",
+                "ok",
+                240,
+                0.2,
+                &(now - chrono::Duration::minutes(3)).to_rfc3339(),
+            )
+            .unwrap();
+        dashboard.toggle_timeline_mode();
+
+        dashboard.cycle_timeline_event_filter();
+        dashboard.cycle_timeline_event_filter();
+
+        assert_eq!(
+            dashboard.timeline_event_filter,
+            TimelineEventFilter::Messages
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("timeline filter set to messages")
+        );
+        assert_eq!(dashboard.output_title(), " Timeline messages ");
+
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("received query lead-123"));
+        assert!(!rendered.contains("tool bash"));
+        assert!(!rendered.contains("files changed 1"));
+    }
+
+    #[test]
+    fn timeline_time_filter_hides_old_events() {
+        let now = Utc::now();
+        let mut session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        session.created_at = now - chrono::Duration::hours(3);
+        session.updated_at = now - chrono::Duration::hours(2);
+
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session).unwrap();
+        dashboard
+            .db
+            .insert_tool_log(
+                "focus-12345678",
+                "bash",
+                "cargo test -q",
+                "ok",
+                240,
+                0.2,
+                &(now - chrono::Duration::minutes(3)).to_rfc3339(),
+            )
+            .unwrap();
+        dashboard.toggle_timeline_mode();
+
+        dashboard.cycle_output_time_filter();
+        dashboard.cycle_output_time_filter();
+
+        assert_eq!(dashboard.output_time_filter, OutputTimeFilter::LastHour);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("timeline range set to last 1h")
+        );
+        assert_eq!(dashboard.output_title(), " Timeline last 1h ");
+
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("tool bash"));
+        assert!(!rendered.contains("created session as planner"));
+        assert!(!rendered.contains("state running"));
+    }
+
+    #[test]
+    fn timeline_scope_all_sessions_renders_cross_session_events() {
+        let now = Utc::now();
+        let mut focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        focus.created_at = now - chrono::Duration::hours(2);
+        focus.updated_at = now - chrono::Duration::minutes(5);
+
+        let mut review = sample_session(
+            "review-87654321",
+            "reviewer",
+            SessionState::Idle,
+            Some("ecc/review"),
+            256,
+            12,
+        );
+        review.created_at = now - chrono::Duration::hours(1);
+        review.updated_at = now - chrono::Duration::minutes(3);
+        review.metrics.files_changed = 2;
+
+        let mut dashboard = test_dashboard(vec![focus.clone(), review.clone()], 0);
+        dashboard.db.insert_session(&focus).unwrap();
+        dashboard.db.insert_session(&review).unwrap();
+        dashboard
+            .db
+            .insert_tool_log(
+                "focus-12345678",
+                "bash",
+                "cargo test -q",
+                "ok",
+                240,
+                0.2,
+                &(now - chrono::Duration::minutes(4)).to_rfc3339(),
+            )
+            .unwrap();
+        dashboard
+            .db
+            .insert_tool_log(
+                "review-87654321",
+                "git",
+                "git status --short",
+                "ok",
+                120,
+                0.1,
+                &(now - chrono::Duration::minutes(2)).to_rfc3339(),
+            )
+            .unwrap();
+        dashboard.toggle_timeline_mode();
+
+        dashboard.toggle_search_scope();
+
+        assert_eq!(dashboard.timeline_scope, SearchScope::AllSessions);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("timeline scope set to all sessions")
+        );
+        assert_eq!(dashboard.output_title(), " Timeline all sessions ");
+
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("focus-12"));
+        assert!(rendered.contains("review-8"));
+        assert!(rendered.contains("tool bash"));
+        assert!(rendered.contains("tool git"));
     }
 
     #[test]
@@ -2948,6 +6156,200 @@ diff --git a/src/next.rs b/src/next.rs
         ));
         assert!(text.contains("Coordination mode dispatch-first"));
         assert!(text.contains("Next route reuse idle worker-1"));
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_delegate_task_board() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        dashboard.selected_child_sessions = vec![DelegatedChildSummary {
+            session_id: "delegate-12345678".to_string(),
+            state: SessionState::Running,
+            worktree_health: Some(worktree::WorktreeHealth::Conflicted),
+            approval_backlog: 1,
+            handoff_backlog: 2,
+            tokens_used: 1_280,
+            files_changed: 3,
+            duration_secs: 12,
+            task_preview: "Implement rust tui delegate board".to_string(),
+            branch: Some("ecc/delegate-12345678".to_string()),
+            last_output_preview: Some("Investigating pane selection behavior".to_string()),
+        }];
+
+        let text = dashboard.selected_session_metrics_text();
+        assert!(
+            text.contains(
+                "- delegate [Running] | next resolve conflict | worktree conflicted | approvals 1 | backlog 2 | progress 1,280 tok / 3 files / 00:00:12 | task Implement rust tui delegate board | branch ecc/delegate-12345678"
+            )
+        );
+        assert!(text.contains("  last output Investigating pane selection behavior"));
+    }
+
+    #[test]
+    fn selected_session_metrics_text_marks_focused_delegate_row() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        dashboard.selected_child_sessions = vec![
+            DelegatedChildSummary {
+                session_id: "delegate-12345678".to_string(),
+                state: SessionState::Running,
+                worktree_health: None,
+                approval_backlog: 0,
+                handoff_backlog: 0,
+                tokens_used: 128,
+                files_changed: 1,
+                duration_secs: 5,
+                task_preview: "First delegate".to_string(),
+                branch: None,
+                last_output_preview: None,
+            },
+            DelegatedChildSummary {
+                session_id: "delegate-22345678".to_string(),
+                state: SessionState::Idle,
+                worktree_health: Some(worktree::WorktreeHealth::InProgress),
+                approval_backlog: 1,
+                handoff_backlog: 2,
+                tokens_used: 64,
+                files_changed: 2,
+                duration_secs: 10,
+                task_preview: "Second delegate".to_string(),
+                branch: Some("ecc/delegate-22345678".to_string()),
+                last_output_preview: Some("Waiting on approval".to_string()),
+            },
+        ];
+        dashboard.focused_delegate_session_id = Some("delegate-22345678".to_string());
+
+        let text = dashboard.selected_session_metrics_text();
+        assert!(text.contains("- delegate [Running] | next let it run"));
+        assert!(text.contains(
+            ">> delegate [Idle] | next review approvals | worktree in progress | approvals 1 | backlog 2 | progress 64 tok / 2 files / 00:00:10 | task Second delegate | branch ecc/delegate-22345678"
+        ));
+        assert!(text.contains("  last output Waiting on approval"));
+    }
+
+    #[test]
+    fn focus_next_delegate_wraps_across_delegate_board() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        dashboard.selected_child_sessions = vec![
+            DelegatedChildSummary {
+                session_id: "delegate-12345678".to_string(),
+                state: SessionState::Running,
+                worktree_health: None,
+                approval_backlog: 0,
+                handoff_backlog: 0,
+                tokens_used: 128,
+                files_changed: 1,
+                duration_secs: 5,
+                task_preview: "First delegate".to_string(),
+                branch: None,
+                last_output_preview: None,
+            },
+            DelegatedChildSummary {
+                session_id: "delegate-22345678".to_string(),
+                state: SessionState::Idle,
+                worktree_health: None,
+                approval_backlog: 0,
+                handoff_backlog: 0,
+                tokens_used: 64,
+                files_changed: 2,
+                duration_secs: 10,
+                task_preview: "Second delegate".to_string(),
+                branch: None,
+                last_output_preview: None,
+            },
+        ];
+        dashboard.focused_delegate_session_id = Some("delegate-12345678".to_string());
+
+        dashboard.focus_next_delegate();
+        assert_eq!(
+            dashboard.focused_delegate_session_id.as_deref(),
+            Some("delegate-22345678")
+        );
+
+        dashboard.focus_next_delegate();
+        assert_eq!(
+            dashboard.focused_delegate_session_id.as_deref(),
+            Some("delegate-12345678")
+        );
+    }
+
+    #[test]
+    fn open_focused_delegate_switches_selected_session() {
+        let sessions = vec![
+            sample_session(
+                "lead-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/lead"),
+                512,
+                42,
+            ),
+            sample_session(
+                "delegate-12345678",
+                "claude",
+                SessionState::Running,
+                Some("ecc/delegate"),
+                256,
+                12,
+            ),
+        ];
+        let mut dashboard = test_dashboard(sessions, 0);
+        dashboard.selected_child_sessions = vec![DelegatedChildSummary {
+            session_id: "delegate-12345678".to_string(),
+            state: SessionState::Running,
+            worktree_health: Some(worktree::WorktreeHealth::InProgress),
+            approval_backlog: 1,
+            handoff_backlog: 0,
+            tokens_used: 256,
+            files_changed: 2,
+            duration_secs: 12,
+            task_preview: "Investigate focused delegate navigation".to_string(),
+            branch: Some("ecc/delegate".to_string()),
+            last_output_preview: Some("Reviewing lead metrics".to_string()),
+        }];
+        dashboard.focused_delegate_session_id = Some("delegate-12345678".to_string());
+        dashboard.output_follow = false;
+        dashboard.output_scroll_offset = 9;
+        dashboard.metrics_scroll_offset = 4;
+
+        dashboard.open_focused_delegate();
+
+        assert_eq!(dashboard.selected_session_id(), Some("delegate-12345678"));
+        assert!(dashboard.output_follow);
+        assert_eq!(dashboard.output_scroll_offset, 0);
+        assert_eq!(dashboard.metrics_scroll_offset, 0);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("opened delegate delegate")
+        );
     }
 
     #[test]
@@ -3450,6 +6852,260 @@ diff --git a/src/next.rs b/src/next.rs
     }
 
     #[test]
+    fn sync_selected_lineage_populates_delegate_task_and_output_previews() {
+        let lead = sample_session(
+            "lead-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/lead"),
+            512,
+            42,
+        );
+        let mut child = sample_session(
+            "worker-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/worker"),
+            128,
+            12,
+        );
+        child.task = "Implement delegate metrics board for ECC 2.0".to_string();
+
+        let mut dashboard = test_dashboard(vec![lead.clone(), child.clone()], 0);
+        dashboard.db.insert_session(&lead).unwrap();
+        dashboard.db.insert_session(&child).unwrap();
+        dashboard
+            .db
+            .update_metrics("worker-12345678", &child.metrics)
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-12345678",
+                "{\"task\":\"Delegated work\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .append_output_line(
+                "worker-12345678",
+                OutputStream::Stdout,
+                "Reviewing delegate metrics board layout",
+            )
+            .unwrap();
+        dashboard
+            .approval_queue_counts
+            .insert("worker-12345678".into(), 2);
+        dashboard.worktree_health_by_session.insert(
+            "worker-12345678".into(),
+            worktree::WorktreeHealth::InProgress,
+        );
+
+        dashboard.sync_selected_lineage();
+
+        assert_eq!(dashboard.selected_child_sessions.len(), 1);
+        assert_eq!(
+            dashboard.selected_child_sessions[0].worktree_health,
+            Some(worktree::WorktreeHealth::InProgress)
+        );
+        assert_eq!(dashboard.selected_child_sessions[0].approval_backlog, 2);
+        assert_eq!(dashboard.selected_child_sessions[0].tokens_used, 128);
+        assert_eq!(dashboard.selected_child_sessions[0].files_changed, 2);
+        assert_eq!(dashboard.selected_child_sessions[0].duration_secs, 12);
+        assert_eq!(
+            dashboard.selected_child_sessions[0].task_preview,
+            "Implement delegate metrics board for EC…"
+        );
+        assert_eq!(
+            dashboard.selected_child_sessions[0].branch.as_deref(),
+            Some("ecc/worker")
+        );
+        assert_eq!(
+            dashboard.selected_child_sessions[0]
+                .last_output_preview
+                .as_deref(),
+            Some("Reviewing delegate metrics board layout")
+        );
+    }
+
+    #[test]
+    fn sync_selected_lineage_prioritizes_conflicted_delegate_rows() {
+        let lead = sample_session(
+            "lead-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/lead"),
+            512,
+            42,
+        );
+        let conflicted = sample_session(
+            "worker-conflict",
+            "planner",
+            SessionState::Running,
+            Some("ecc/conflict"),
+            128,
+            12,
+        );
+        let idle = sample_session(
+            "worker-idle",
+            "planner",
+            SessionState::Idle,
+            Some("ecc/idle"),
+            64,
+            6,
+        );
+
+        let mut dashboard = test_dashboard(vec![lead.clone(), conflicted.clone(), idle.clone()], 0);
+        dashboard.db.insert_session(&lead).unwrap();
+        dashboard.db.insert_session(&conflicted).unwrap();
+        dashboard.db.insert_session(&idle).unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-conflict",
+                "{\"task\":\"Handle conflict\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-idle",
+                "{\"task\":\"Idle follow-up\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard.worktree_health_by_session.insert(
+            "worker-conflict".into(),
+            worktree::WorktreeHealth::Conflicted,
+        );
+
+        dashboard.sync_selected_lineage();
+
+        assert_eq!(dashboard.selected_child_sessions.len(), 2);
+        assert_eq!(
+            dashboard.selected_child_sessions[0].session_id,
+            "worker-conflict"
+        );
+        assert_eq!(
+            dashboard.selected_child_sessions[0].worktree_health,
+            Some(worktree::WorktreeHealth::Conflicted)
+        );
+    }
+
+    #[test]
+    fn sync_selected_lineage_preserves_focused_delegate_by_session_id() {
+        let lead = sample_session(
+            "lead-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/lead"),
+            512,
+            42,
+        );
+        let conflicted = sample_session(
+            "worker-conflict",
+            "planner",
+            SessionState::Running,
+            Some("ecc/conflict"),
+            128,
+            12,
+        );
+        let idle = sample_session(
+            "worker-idle",
+            "planner",
+            SessionState::Idle,
+            Some("ecc/idle"),
+            64,
+            6,
+        );
+
+        let mut dashboard = test_dashboard(vec![lead.clone(), conflicted.clone(), idle.clone()], 0);
+        dashboard.db.insert_session(&lead).unwrap();
+        dashboard.db.insert_session(&conflicted).unwrap();
+        dashboard.db.insert_session(&idle).unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-conflict",
+                "{\"task\":\"Handle conflict\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-idle",
+                "{\"task\":\"Idle follow-up\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard.sync_selected_lineage();
+        dashboard.focused_delegate_session_id = Some("worker-idle".to_string());
+        dashboard.worktree_health_by_session.insert(
+            "worker-conflict".into(),
+            worktree::WorktreeHealth::Conflicted,
+        );
+
+        dashboard.sync_selected_lineage();
+
+        assert_eq!(
+            dashboard.focused_delegate_session_id.as_deref(),
+            Some("worker-idle")
+        );
+    }
+
+    #[test]
+    fn sync_selected_lineage_keeps_all_delegate_rows() {
+        let lead = sample_session(
+            "lead-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/lead"),
+            512,
+            42,
+        );
+
+        let mut sessions = vec![lead.clone()];
+        let mut dashboard = test_dashboard(vec![lead.clone()], 0);
+        dashboard.db.insert_session(&lead).unwrap();
+
+        for index in 0..5 {
+            let child_id = format!("worker-{index}");
+            let child = sample_session(
+                &child_id,
+                "planner",
+                SessionState::Running,
+                Some(&format!("ecc/{child_id}")),
+                64,
+                6,
+            );
+            sessions.push(child.clone());
+            dashboard.db.insert_session(&child).unwrap();
+            dashboard
+                .db
+                .send_message(
+                    "lead-12345678",
+                    &child_id,
+                    "{\"task\":\"Delegated work\",\"context\":\"Delegated from lead\"}",
+                    "task_handoff",
+                )
+                .unwrap();
+        }
+
+        dashboard.sessions = sessions;
+        dashboard.sync_selected_lineage();
+
+        assert_eq!(dashboard.selected_child_sessions.len(), 5);
+    }
+
+    #[test]
     fn aggregate_cost_summary_mentions_total_cost() {
         let db = StateStore::open(Path::new(":memory:")).unwrap();
         let mut cfg = Config::default();
@@ -3460,7 +7116,136 @@ diff --git a/src/next.rs b/src/next.rs
 
         assert_eq!(
             dashboard.aggregate_cost_summary_text(),
-            "Aggregate cost $8.25 / $10.00 | Budget warning"
+            "Aggregate cost $8.25 / $10.00 | Budget alert 75%"
+        );
+    }
+
+    #[test]
+    fn aggregate_cost_summary_mentions_fifty_percent_alert() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.cost_budget_usd = 10.0;
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.sessions = vec![budget_session("sess-1", 1_000, 5.0)];
+
+        assert_eq!(
+            dashboard.aggregate_cost_summary_text(),
+            "Aggregate cost $5.00 / $10.00 | Budget alert 50%"
+        );
+    }
+
+    #[test]
+    fn aggregate_cost_summary_uses_custom_threshold_labels() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.cost_budget_usd = 10.0;
+        cfg.budget_alert_thresholds = crate::config::BudgetAlertThresholds {
+            advisory: 0.40,
+            warning: 0.70,
+            critical: 0.85,
+        };
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.sessions = vec![budget_session("sess-1", 1_000, 7.0)];
+
+        assert_eq!(
+            dashboard.aggregate_cost_summary_text(),
+            "Aggregate cost $7.00 / $10.00 | Budget alert 70%"
+        );
+    }
+
+    #[test]
+    fn aggregate_cost_summary_mentions_ninety_percent_alert() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.cost_budget_usd = 10.0;
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.sessions = vec![budget_session("sess-1", 1_000, 9.0)];
+
+        assert_eq!(
+            dashboard.aggregate_cost_summary_text(),
+            "Aggregate cost $9.00 / $10.00 | Budget alert 90%"
+        );
+    }
+
+    #[test]
+    fn sync_budget_alerts_sets_operator_note_when_threshold_is_crossed() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.token_budget = 1_000;
+        cfg.cost_budget_usd = 10.0;
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.sessions = vec![budget_session("sess-1", 760, 2.0)];
+        dashboard.last_budget_alert_state = BudgetState::Alert50;
+
+        dashboard.sync_budget_alerts();
+
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("Budget alert 75% | tokens 760 / 1,000 | cost $2.00 / $10.00")
+        );
+        assert_eq!(dashboard.last_budget_alert_state, BudgetState::Alert75);
+    }
+
+    #[test]
+    fn sync_budget_alerts_uses_custom_threshold_labels() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.token_budget = 1_000;
+        cfg.cost_budget_usd = 10.0;
+        cfg.budget_alert_thresholds = crate::config::BudgetAlertThresholds {
+            advisory: 0.40,
+            warning: 0.70,
+            critical: 0.85,
+        };
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.sessions = vec![budget_session("sess-1", 710, 2.0)];
+        dashboard.last_budget_alert_state = BudgetState::Alert50;
+
+        dashboard.sync_budget_alerts();
+
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("Budget alert 70% | tokens 710 / 1,000 | cost $2.00 / $10.00")
+        );
+        assert_eq!(dashboard.last_budget_alert_state, BudgetState::Alert75);
+    }
+
+    #[test]
+    fn refresh_auto_pauses_over_budget_sessions_and_sets_operator_note() {
+        let db = StateStore::open(Path::new(":memory:")).unwrap();
+        let mut cfg = Config::default();
+        cfg.token_budget = 100;
+        cfg.cost_budget_usd = 0.0;
+
+        db.insert_session(&budget_session("sess-1", 120, 0.0))
+            .expect("insert session");
+        db.update_metrics(
+            "sess-1",
+            &SessionMetrics {
+                input_tokens: 90,
+                output_tokens: 30,
+                tokens_used: 120,
+                tool_calls: 0,
+                files_changed: 0,
+                duration_secs: 0,
+                cost_usd: 0.0,
+            },
+        )
+        .expect("persist metrics");
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.refresh();
+
+        assert_eq!(dashboard.sessions.len(), 1);
+        assert_eq!(dashboard.sessions[0].state, SessionState::Stopped);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("token budget exceeded | auto-paused 1 active session(s)")
         );
     }
 
@@ -3499,6 +7284,90 @@ diff --git a/src/next.rs b/src/next.rs
         );
 
         assert_eq!(dashboard.active_session_count(), 3);
+    }
+
+    #[test]
+    fn spawn_prompt_seed_uses_selected_session_context() {
+        let dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+
+        assert_eq!(
+            dashboard.spawn_prompt_seed(),
+            "give me 2 agents working on Follow up on focus-12: Render dashboard rows"
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_extracts_count_and_task_from_natural_language() {
+        let request = parse_spawn_request("give me 10 agents working on stabilize the queue")
+            .expect("spawn request should parse");
+
+        assert_eq!(
+            request,
+            SpawnRequest {
+                requested_count: 10,
+                task: "stabilize the queue".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_defaults_to_single_session_without_count() {
+        let request = parse_spawn_request("stabilize the queue").expect("spawn request");
+
+        assert_eq!(
+            request,
+            SpawnRequest {
+                requested_count: 1,
+                task: "stabilize the queue".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_spawn_plan_caps_requested_count_to_available_slots() {
+        let dashboard = test_dashboard(
+            vec![
+                sample_session("pending-1", "planner", SessionState::Pending, None, 1, 1),
+                sample_session("running-1", "planner", SessionState::Running, None, 1, 1),
+                sample_session("idle-1", "planner", SessionState::Idle, None, 1, 1),
+            ],
+            0,
+        );
+
+        let plan = dashboard
+            .build_spawn_plan("give me 9 agents working on ship release notes")
+            .expect("spawn plan");
+
+        assert_eq!(
+            plan,
+            SpawnPlan {
+                requested_count: 9,
+                spawn_count: 5,
+                task: "ship release notes".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn expand_spawn_tasks_suffixes_multi_session_requests() {
+        assert_eq!(
+            expand_spawn_tasks("stabilize the queue", 3),
+            vec![
+                "stabilize the queue [1/3]".to_string(),
+                "stabilize the queue [2/3]".to_string(),
+                "stabilize the queue [3/3]".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3544,7 +7413,7 @@ diff --git a/src/next.rs b/src/next.rs
     }
 
     #[test]
-    fn metrics_scroll_does_not_mutate_output_scroll() -> Result<()> {
+    fn metrics_scroll_uses_independent_offset() -> Result<()> {
         let db_path = std::env::temp_dir().join(format!("ecc2-dashboard-{}.db", Uuid::new_v4()));
         let db = StateStore::open(&db_path)?;
         let now = Utc::now();
@@ -3574,10 +7443,13 @@ diff --git a/src/next.rs b/src/next.rs
         let previous_scroll = dashboard.output_scroll_offset;
 
         dashboard.selected_pane = Pane::Metrics;
+        dashboard.last_metrics_height = 2;
         dashboard.scroll_up();
+        dashboard.scroll_down();
         dashboard.scroll_down();
 
         assert_eq!(dashboard.output_scroll_offset, previous_scroll);
+        assert_eq!(dashboard.metrics_scroll_offset, 2);
         let _ = std::fs::remove_file(db_path);
         Ok(())
     }
@@ -3615,6 +7487,605 @@ diff --git a/src/next.rs b/src/next.rs
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
+    }
+
+    #[test]
+    fn submit_search_tracks_matches_and_sets_navigation_note() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha"),
+                test_output_line(OutputStream::Stdout, "beta"),
+                test_output_line(OutputStream::Stdout, "alpha tail"),
+            ],
+        );
+        dashboard.last_output_height = 2;
+
+        dashboard.begin_search();
+        for ch in "alpha.*".chars() {
+            dashboard.push_input_char(ch);
+        }
+        dashboard.submit_search();
+
+        assert_eq!(dashboard.search_query.as_deref(), Some("alpha.*"));
+        assert_eq!(
+            dashboard.search_matches,
+            vec![
+                SearchMatch {
+                    session_id: "focus-12345678".to_string(),
+                    line_index: 0,
+                },
+                SearchMatch {
+                    session_id: "focus-12345678".to_string(),
+                    line_index: 2,
+                },
+            ]
+        );
+        assert_eq!(dashboard.selected_search_match, 0);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("search /alpha.* matched 2 line(s) across 1 session(s) | n/N navigate matches")
+        );
+    }
+
+    #[test]
+    fn next_search_match_wraps_and_updates_scroll_offset() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha-1"),
+                test_output_line(OutputStream::Stdout, "beta"),
+                test_output_line(OutputStream::Stdout, "alpha-2"),
+            ],
+        );
+        dashboard.search_query = Some(r"alpha-\d".to_string());
+        dashboard.last_output_height = 1;
+        dashboard.recompute_search_matches();
+
+        dashboard.next_search_match();
+        assert_eq!(dashboard.selected_search_match, 1);
+        assert_eq!(dashboard.output_scroll_offset, 2);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some(r"search /alpha-\d match 2/2 | selected session")
+        );
+
+        dashboard.next_search_match();
+        assert_eq!(dashboard.selected_search_match, 0);
+        assert_eq!(dashboard.output_scroll_offset, 0);
+    }
+
+    #[test]
+    fn submit_search_rejects_invalid_regex_and_keeps_input() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+
+        dashboard.begin_search();
+        for ch in "(".chars() {
+            dashboard.push_input_char(ch);
+        }
+        dashboard.submit_search();
+
+        assert_eq!(dashboard.search_input.as_deref(), Some("("));
+        assert!(dashboard.search_query.is_none());
+        assert!(dashboard.search_matches.is_empty());
+        assert!(dashboard
+            .operator_note
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("invalid regex /(:"));
+    }
+
+    #[test]
+    fn clear_search_resets_active_query_and_matches() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.search_input = Some("draft".to_string());
+        dashboard.search_query = Some("alpha".to_string());
+        dashboard.search_matches = vec![
+            SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 1,
+            },
+            SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 3,
+            },
+        ];
+        dashboard.selected_search_match = 1;
+
+        dashboard.clear_search();
+
+        assert!(dashboard.search_input.is_none());
+        assert!(dashboard.search_query.is_none());
+        assert!(dashboard.search_matches.is_empty());
+        assert_eq!(dashboard.selected_search_match, 0);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("cleared output search")
+        );
+    }
+
+    #[test]
+    fn toggle_output_filter_keeps_only_stderr_lines() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "stdout line"),
+                test_output_line(OutputStream::Stderr, "stderr line"),
+            ],
+        );
+
+        dashboard.toggle_output_filter();
+
+        assert_eq!(dashboard.output_filter, OutputFilter::ErrorsOnly);
+        assert_eq!(dashboard.visible_output_text(), "stderr line");
+        assert_eq!(dashboard.output_title(), " Output errors ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("output filter set to errors")
+        );
+    }
+
+    #[test]
+    fn toggle_output_filter_cycles_tool_calls_and_file_changes() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "normal output"),
+                test_output_line(OutputStream::Stdout, "Read(src/lib.rs)"),
+                test_output_line(OutputStream::Stdout, "Updated ecc2/src/tui/dashboard.rs"),
+                test_output_line(OutputStream::Stderr, "stderr line"),
+            ],
+        );
+
+        dashboard.toggle_output_filter();
+        assert_eq!(dashboard.output_filter, OutputFilter::ErrorsOnly);
+        assert_eq!(dashboard.visible_output_text(), "stderr line");
+
+        dashboard.toggle_output_filter();
+        assert_eq!(dashboard.output_filter, OutputFilter::ToolCallsOnly);
+        assert_eq!(dashboard.visible_output_text(), "Read(src/lib.rs)");
+        assert_eq!(dashboard.output_title(), " Output tool calls ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("output filter set to tool calls")
+        );
+
+        dashboard.toggle_output_filter();
+        assert_eq!(dashboard.output_filter, OutputFilter::FileChangesOnly);
+        assert_eq!(
+            dashboard.visible_output_text(),
+            "Updated ecc2/src/tui/dashboard.rs"
+        );
+        assert_eq!(dashboard.output_title(), " Output file changes ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("output filter set to file changes")
+        );
+    }
+
+    #[test]
+    fn search_matches_respect_error_only_filter() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha stdout"),
+                test_output_line(OutputStream::Stderr, "alpha stderr"),
+                test_output_line(OutputStream::Stderr, "beta stderr"),
+            ],
+        );
+        dashboard.output_filter = OutputFilter::ErrorsOnly;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+
+        dashboard.recompute_search_matches();
+
+        assert_eq!(
+            dashboard.search_matches,
+            vec![SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 0,
+            }]
+        );
+        assert_eq!(dashboard.visible_output_text(), "alpha stderr\nbeta stderr");
+    }
+
+    #[test]
+    fn search_matches_respect_tool_call_filter() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha normal"),
+                test_output_line(OutputStream::Stdout, "Read(alpha.rs)"),
+                test_output_line(OutputStream::Stdout, "Write(beta.rs)"),
+            ],
+        );
+        dashboard.output_filter = OutputFilter::ToolCallsOnly;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+
+        dashboard.recompute_search_matches();
+
+        assert_eq!(
+            dashboard.search_matches,
+            vec![SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 0,
+            }]
+        );
+        assert_eq!(
+            dashboard.visible_output_text(),
+            "Read(alpha.rs)\nWrite(beta.rs)"
+        );
+    }
+
+    #[test]
+    fn search_matches_respect_file_change_filter() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha normal"),
+                test_output_line(OutputStream::Stdout, "Updated alpha.rs"),
+                test_output_line(OutputStream::Stdout, "Renamed beta.rs to gamma.rs"),
+            ],
+        );
+        dashboard.output_filter = OutputFilter::FileChangesOnly;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+
+        dashboard.recompute_search_matches();
+
+        assert_eq!(
+            dashboard.search_matches,
+            vec![SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 0,
+            }]
+        );
+        assert_eq!(
+            dashboard.visible_output_text(),
+            "Updated alpha.rs\nRenamed beta.rs to gamma.rs"
+        );
+    }
+
+    #[test]
+    fn cycle_output_time_filter_keeps_only_recent_lines() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line_minutes_ago(OutputStream::Stdout, "recent line", 5),
+                test_output_line_minutes_ago(OutputStream::Stdout, "older line", 45),
+                test_output_line_minutes_ago(OutputStream::Stdout, "stale line", 180),
+            ],
+        );
+
+        dashboard.cycle_output_time_filter();
+
+        assert_eq!(
+            dashboard.output_time_filter,
+            OutputTimeFilter::Last15Minutes
+        );
+        assert_eq!(dashboard.visible_output_text(), "recent line");
+        assert_eq!(dashboard.output_title(), " Output last 15m ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("output time filter set to last 15m")
+        );
+    }
+
+    #[test]
+    fn search_matches_respect_time_filter() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line_minutes_ago(OutputStream::Stdout, "alpha recent", 10),
+                test_output_line_minutes_ago(OutputStream::Stdout, "beta recent", 10),
+                test_output_line_minutes_ago(OutputStream::Stdout, "alpha stale", 180),
+            ],
+        );
+        dashboard.output_time_filter = OutputTimeFilter::Last15Minutes;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+
+        dashboard.recompute_search_matches();
+
+        assert_eq!(
+            dashboard.search_matches,
+            vec![SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 0,
+            }]
+        );
+        assert_eq!(dashboard.visible_output_text(), "alpha recent\nbeta recent");
+    }
+
+    #[test]
+    fn search_scope_all_sessions_matches_across_output_buffers() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session(
+                    "focus-12345678",
+                    "planner",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+                sample_session(
+                    "review-87654321",
+                    "reviewer",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+            ],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha local")],
+        );
+        dashboard.session_output_cache.insert(
+            "review-87654321".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha global")],
+        );
+        dashboard.search_query = Some("alpha.*".to_string());
+
+        dashboard.toggle_search_scope();
+
+        assert_eq!(dashboard.search_scope, SearchScope::AllSessions);
+        assert_eq!(
+            dashboard.search_matches,
+            vec![
+                SearchMatch {
+                    session_id: "focus-12345678".to_string(),
+                    line_index: 0,
+                },
+                SearchMatch {
+                    session_id: "review-87654321".to_string(),
+                    line_index: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("search scope set to all sessions | 2 match(es)")
+        );
+        assert_eq!(
+            dashboard.output_title(),
+            " Output all sessions /alpha.* 1/2 "
+        );
+    }
+
+    #[test]
+    fn next_search_match_switches_selected_session_in_all_sessions_scope() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session(
+                    "focus-12345678",
+                    "planner",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+                sample_session(
+                    "review-87654321",
+                    "reviewer",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+            ],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha local")],
+        );
+        dashboard.session_output_cache.insert(
+            "review-87654321".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha global")],
+        );
+        dashboard.search_scope = SearchScope::AllSessions;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+        dashboard.recompute_search_matches();
+
+        dashboard.next_search_match();
+
+        assert_eq!(dashboard.selected_session_id(), Some("review-87654321"));
+        assert_eq!(dashboard.selected_search_match, 1);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("search /alpha.* match 2/2 | all sessions")
+        );
+    }
+
+    #[test]
+    fn search_agent_filter_selected_agent_type_limits_global_search() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session(
+                    "focus-12345678",
+                    "planner",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+                sample_session(
+                    "planner-2222222",
+                    "planner",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+                sample_session(
+                    "review-87654321",
+                    "reviewer",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+            ],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha local")],
+        );
+        dashboard.session_output_cache.insert(
+            "planner-2222222".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha planner")],
+        );
+        dashboard.session_output_cache.insert(
+            "review-87654321".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha reviewer")],
+        );
+        dashboard.search_scope = SearchScope::AllSessions;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.recompute_search_matches();
+
+        dashboard.toggle_search_agent_filter();
+
+        assert_eq!(
+            dashboard.search_agent_filter,
+            SearchAgentFilter::SelectedAgentType
+        );
+        assert_eq!(
+            dashboard.search_matches,
+            vec![
+                SearchMatch {
+                    session_id: "focus-12345678".to_string(),
+                    line_index: 0,
+                },
+                SearchMatch {
+                    session_id: "planner-2222222".to_string(),
+                    line_index: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("search agent filter set to agent planner | 2 match(es)")
+        );
+        assert_eq!(
+            dashboard.output_title(),
+            " Output all sessions agent planner /alpha.* 1/2 "
+        );
     }
 
     #[tokio::test]
@@ -4150,11 +8621,92 @@ diff --git a/src/next.rs b/src/next.rs
         dashboard.pane_size_percent = DEFAULT_GRID_SIZE_PERCENT;
 
         let areas = dashboard.pane_areas(Rect::new(0, 0, 100, 40));
+        let output_area = areas.output.expect("grid layout should include output");
+        let metrics_area = areas.metrics.expect("grid layout should include metrics");
         let log_area = areas.log.expect("grid layout should include a log pane");
 
-        assert!(areas.output.x > areas.sessions.x);
-        assert!(areas.metrics.y > areas.sessions.y);
-        assert!(log_area.x > areas.metrics.x);
+        assert!(output_area.x > areas.sessions.x);
+        assert!(metrics_area.y > areas.sessions.y);
+        assert!(log_area.x > metrics_area.x);
+    }
+
+    #[test]
+    fn collapse_selected_pane_hides_metrics_and_moves_focus() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.selected_pane = Pane::Metrics;
+
+        dashboard.collapse_selected_pane();
+
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+        assert_eq!(
+            dashboard.visible_panes(),
+            vec![Pane::Sessions, Pane::Output]
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("collapsed metrics pane")
+        );
+    }
+
+    #[test]
+    fn collapse_selected_pane_rejects_sessions_and_last_detail_pane() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+
+        dashboard.collapse_selected_pane();
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("cannot collapse sessions pane")
+        );
+
+        dashboard.selected_pane = Pane::Metrics;
+        dashboard.collapse_selected_pane();
+        dashboard.selected_pane = Pane::Output;
+        dashboard.collapse_selected_pane();
+
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("cannot collapse last detail pane")
+        );
+        assert_eq!(
+            dashboard.visible_panes(),
+            vec![Pane::Sessions, Pane::Output]
+        );
+    }
+
+    #[test]
+    fn restore_collapsed_panes_restores_hidden_tabs() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.selected_pane = Pane::Metrics;
+        dashboard.collapse_selected_pane();
+
+        dashboard.restore_collapsed_panes();
+
+        assert_eq!(
+            dashboard.visible_panes(),
+            vec![Pane::Sessions, Pane::Output, Pane::Metrics]
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("restored 1 collapsed pane(s)")
+        );
+    }
+
+    #[test]
+    fn collapsed_grid_reflows_to_horizontal_detail_stack() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_layout = PaneLayout::Grid;
+        dashboard.pane_size_percent = DEFAULT_GRID_SIZE_PERCENT;
+        dashboard.selected_pane = Pane::Log;
+        dashboard.collapse_selected_pane();
+
+        let areas = dashboard.pane_areas(Rect::new(0, 0, 100, 40));
+        let output_area = areas.output.expect("output should stay visible");
+        let metrics_area = areas.metrics.expect("metrics should stay visible");
+
+        assert!(areas.log.is_none());
+        assert_eq!(areas.sessions.height, 40);
+        assert_eq!(output_area.width, metrics_area.width);
+        assert!(metrics_area.y > output_area.y);
     }
 
     #[test]
@@ -4164,12 +8716,12 @@ diff --git a/src/next.rs b/src/next.rs
         dashboard.pane_size_percent = DEFAULT_GRID_SIZE_PERCENT;
 
         for _ in 0..20 {
-            dashboard.increase_pane_size();
+            dashboard.adjust_pane_size_with_save(5, Path::new("/tmp/ecc2-noop.toml"), |_| Ok(()));
         }
         assert_eq!(dashboard.pane_size_percent, MAX_PANE_SIZE_PERCENT);
 
         for _ in 0..40 {
-            dashboard.decrease_pane_size();
+            dashboard.adjust_pane_size_with_save(-5, Path::new("/tmp/ecc2-noop.toml"), |_| Ok(()));
         }
         assert_eq!(dashboard.pane_size_percent, MIN_PANE_SIZE_PERCENT);
     }
@@ -4190,6 +8742,372 @@ diff --git a/src/next.rs b/src/next.rs
         assert_eq!(dashboard.selected_pane, Pane::Log);
     }
 
+    #[test]
+    fn focus_pane_number_selects_visible_panes_and_rejects_hidden_targets() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+
+        dashboard.focus_pane_number(3);
+
+        assert_eq!(dashboard.selected_pane, Pane::Metrics);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("focused metrics pane")
+        );
+
+        dashboard.focus_pane_number(4);
+
+        assert_eq!(dashboard.selected_pane, Pane::Metrics);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("log pane is not visible")
+        );
+    }
+
+    #[test]
+    fn directional_pane_focus_uses_grid_neighbors() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_layout = PaneLayout::Grid;
+        dashboard.pane_size_percent = DEFAULT_GRID_SIZE_PERCENT;
+
+        dashboard.focus_pane_right();
+        assert_eq!(dashboard.selected_pane, Pane::Output);
+
+        dashboard.focus_pane_down();
+        assert_eq!(dashboard.selected_pane, Pane::Log);
+
+        dashboard.focus_pane_left();
+        assert_eq!(dashboard.selected_pane, Pane::Metrics);
+
+        dashboard.focus_pane_up();
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("focused sessions pane")
+        );
+    }
+
+    #[test]
+    fn configured_pane_navigation_keys_override_defaults() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_navigation.focus_metrics = "e".to_string();
+        dashboard.cfg.pane_navigation.move_left = "a".to_string();
+
+        assert!(dashboard.handle_pane_navigation_key(KeyEvent::new(
+            crossterm::event::KeyCode::Char('e'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(dashboard.selected_pane, Pane::Metrics);
+
+        assert!(dashboard.handle_pane_navigation_key(KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+    }
+
+    #[test]
+    fn pane_navigation_labels_use_configured_bindings() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_navigation.focus_sessions = "q".to_string();
+        dashboard.cfg.pane_navigation.focus_output = "w".to_string();
+        dashboard.cfg.pane_navigation.focus_metrics = "e".to_string();
+        dashboard.cfg.pane_navigation.focus_log = "r".to_string();
+        dashboard.cfg.pane_navigation.move_left = "a".to_string();
+        dashboard.cfg.pane_navigation.move_down = "s".to_string();
+        dashboard.cfg.pane_navigation.move_up = "w".to_string();
+        dashboard.cfg.pane_navigation.move_right = "d".to_string();
+
+        assert_eq!(dashboard.pane_focus_shortcuts_label(), "q/w/e/r");
+        assert_eq!(dashboard.pane_move_shortcuts_label(), "a/s/w/d");
+    }
+
+    #[test]
+    fn pane_command_mode_handles_focus_and_cancel() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+
+        dashboard.begin_pane_command_mode();
+        assert!(dashboard.is_pane_command_mode());
+
+        assert!(dashboard.handle_pane_command_key(KeyEvent::new(
+            crossterm::event::KeyCode::Char('3'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(dashboard.selected_pane, Pane::Metrics);
+        assert!(!dashboard.is_pane_command_mode());
+
+        dashboard.begin_pane_command_mode();
+        assert!(dashboard.handle_pane_command_key(KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("pane command cancelled")
+        );
+        assert!(!dashboard.is_pane_command_mode());
+    }
+
+    #[test]
+    fn pane_command_mode_sets_layout() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_layout = PaneLayout::Horizontal;
+
+        dashboard.begin_pane_command_mode();
+        assert!(dashboard.handle_pane_command_key(KeyEvent::new(
+            crossterm::event::KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Grid);
+        assert!(dashboard
+            .operator_note
+            .as_deref()
+            .is_some_and(|note| note.contains("pane layout set to grid | saved to ")));
+    }
+
+    #[test]
+    fn cycle_pane_layout_rotates_and_hides_log_when_leaving_grid() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_layout = PaneLayout::Grid;
+        dashboard.cfg.linear_pane_size_percent = 44;
+        dashboard.cfg.grid_pane_size_percent = 77;
+        dashboard.pane_size_percent = 77;
+        dashboard.selected_pane = Pane::Log;
+
+        dashboard.cycle_pane_layout();
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Horizontal);
+        assert_eq!(dashboard.pane_size_percent, 44);
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+    }
+
+    #[test]
+    fn cycle_pane_layout_persists_config() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        let tempdir = std::env::temp_dir().join(format!("ecc2-layout-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tempdir).unwrap();
+        let config_path = tempdir.join("ecc2.toml");
+
+        dashboard.cycle_pane_layout_with_save(&config_path, |cfg| cfg.save_to_path(&config_path));
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Vertical);
+        let expected_note = format!(
+            "pane layout set to vertical | saved to {}",
+            config_path.display()
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some(expected_note.as_str())
+        );
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.pane_layout, PaneLayout::Vertical);
+        let _ = std::fs::remove_dir_all(tempdir);
+    }
+
+    #[test]
+    fn pane_resize_persists_linear_setting() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        let tempdir = std::env::temp_dir().join(format!("ecc2-pane-size-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tempdir).unwrap();
+        let config_path = tempdir.join("ecc2.toml");
+
+        dashboard.adjust_pane_size_with_save(5, &config_path, |cfg| cfg.save_to_path(&config_path));
+
+        assert_eq!(dashboard.pane_size_percent, 40);
+        assert_eq!(dashboard.cfg.linear_pane_size_percent, 40);
+        let expected_note = format!(
+            "pane size set to 40% for horizontal layout | saved to {}",
+            config_path.display()
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some(expected_note.as_str())
+        );
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.linear_pane_size_percent, 40);
+        assert_eq!(loaded.grid_pane_size_percent, 50);
+        let _ = std::fs::remove_dir_all(tempdir);
+    }
+
+    #[test]
+    fn cycle_pane_layout_uses_persisted_grid_size() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_layout = PaneLayout::Vertical;
+        dashboard.cfg.linear_pane_size_percent = 41;
+        dashboard.cfg.grid_pane_size_percent = 63;
+        dashboard.pane_size_percent = 41;
+
+        dashboard.cycle_pane_layout_with_save(Path::new("/tmp/ecc2-noop.toml"), |_| Ok(()));
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Grid);
+        assert_eq!(dashboard.pane_size_percent, 63);
+    }
+
+    #[test]
+    fn auto_split_layout_after_spawn_prefers_vertical_for_two_live_sessions() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session("running-1", "planner", SessionState::Running, None, 1, 1),
+                sample_session("idle-1", "planner", SessionState::Idle, None, 1, 1),
+            ],
+            0,
+        );
+
+        let note = dashboard.auto_split_layout_after_spawn_with_save(
+            2,
+            Path::new("/tmp/ecc2-noop.toml"),
+            |_| Ok(()),
+        );
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Vertical);
+        assert_eq!(
+            dashboard.pane_size_percent,
+            dashboard.cfg.linear_pane_size_percent
+        );
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+        assert_eq!(
+            note.as_deref(),
+            Some("auto-split vertical layout for 2 live session(s)")
+        );
+    }
+
+    #[test]
+    fn auto_split_layout_after_spawn_prefers_grid_for_three_live_sessions() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session("pending-1", "planner", SessionState::Pending, None, 1, 1),
+                sample_session("running-1", "planner", SessionState::Running, None, 1, 1),
+                sample_session("idle-1", "planner", SessionState::Idle, None, 1, 1),
+            ],
+            1,
+        );
+        dashboard.selected_pane = Pane::Output;
+
+        let note = dashboard.auto_split_layout_after_spawn_with_save(
+            2,
+            Path::new("/tmp/ecc2-noop.toml"),
+            |_| Ok(()),
+        );
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Grid);
+        assert_eq!(
+            dashboard.pane_size_percent,
+            dashboard.cfg.grid_pane_size_percent
+        );
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+        assert_eq!(
+            note.as_deref(),
+            Some("auto-split grid layout for 3 live session(s)")
+        );
+    }
+
+    #[test]
+    fn auto_split_layout_after_spawn_focuses_sessions_when_layout_already_matches() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session("pending-1", "planner", SessionState::Pending, None, 1, 1),
+                sample_session("running-1", "planner", SessionState::Running, None, 1, 1),
+                sample_session("idle-1", "planner", SessionState::Idle, None, 1, 1),
+            ],
+            1,
+        );
+        dashboard.cfg.pane_layout = PaneLayout::Grid;
+        dashboard.selected_pane = Pane::Output;
+
+        let note = dashboard.auto_split_layout_after_spawn_with_save(
+            3,
+            Path::new("/tmp/ecc2-noop.toml"),
+            |_| Ok(()),
+        );
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Grid);
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+        assert_eq!(
+            note.as_deref(),
+            Some("auto-focused sessions in grid layout for 3 live session(s)")
+        );
+    }
+
+    #[test]
+    fn post_spawn_selection_prefers_lead_for_multi_spawn() {
+        let preferred = post_spawn_selection_id(
+            Some("lead-12345678"),
+            &["child-a".to_string(), "child-b".to_string()],
+        );
+
+        assert_eq!(preferred.as_deref(), Some("lead-12345678"));
+    }
+
+    #[test]
+    fn post_spawn_selection_keeps_single_spawn_on_created_session() {
+        let preferred = post_spawn_selection_id(Some("lead-12345678"), &["child-a".to_string()]);
+
+        assert_eq!(preferred.as_deref(), Some("child-a"));
+    }
+
+    #[test]
+    fn post_spawn_selection_falls_back_to_first_created_when_no_lead_exists() {
+        let preferred =
+            post_spawn_selection_id(None, &["child-a".to_string(), "child-b".to_string()]);
+
+        assert_eq!(preferred.as_deref(), Some("child-a"));
+    }
+
+    #[test]
+    fn toggle_theme_persists_config() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        let tempdir = std::env::temp_dir().join(format!("ecc2-theme-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tempdir).unwrap();
+        let config_path = tempdir.join("ecc2.toml");
+
+        dashboard.toggle_theme_with_save(&config_path, |cfg| cfg.save_to_path(&config_path));
+
+        assert_eq!(dashboard.cfg.theme, Theme::Light);
+        let expected_note = format!("theme set to light | saved to {}", config_path.display());
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some(expected_note.as_str())
+        );
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.theme, Theme::Light);
+        let _ = std::fs::remove_dir_all(tempdir);
+    }
+
+    #[test]
+    fn light_theme_uses_light_palette_accent() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.theme = Theme::Light;
+        dashboard.selected_pane = Pane::Sessions;
+
+        assert_eq!(
+            dashboard.pane_border_style(Pane::Sessions),
+            Style::default().fg(Color::Blue)
+        );
+        assert_eq!(dashboard.theme_palette().row_highlight_bg, Color::Gray);
+    }
+
+    fn test_output_line(stream: OutputStream, text: &str) -> OutputLine {
+        OutputLine::new(stream, text, Utc::now().to_rfc3339())
+    }
+
+    fn test_output_line_minutes_ago(
+        stream: OutputStream,
+        text: &str,
+        minutes_ago: i64,
+    ) -> OutputLine {
+        OutputLine::new(
+            stream,
+            text,
+            (Utc::now() - chrono::Duration::minutes(minutes_ago)).to_rfc3339(),
+        )
+    }
+
     fn test_dashboard(sessions: Vec<Session>, selected_session: usize) -> Dashboard {
         let selected_session = selected_session.min(sessions.len().saturating_sub(1));
         let cfg = Config::default();
@@ -4202,16 +9120,15 @@ diff --git a/src/next.rs b/src/next.rs
 
         Dashboard {
             db: StateStore::open(Path::new(":memory:")).expect("open test db"),
-            pane_size_percent: match cfg.pane_layout {
-                PaneLayout::Grid => DEFAULT_GRID_SIZE_PERCENT,
-                PaneLayout::Horizontal | PaneLayout::Vertical => DEFAULT_PANE_SIZE_PERCENT,
-            },
+            pane_size_percent: configured_pane_size(&cfg, cfg.pane_layout),
             cfg,
             output_store,
             output_rx,
             sessions,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
+            approval_queue_counts: HashMap::new(),
+            approval_queue_preview: Vec::new(),
             handoff_backlog_counts: HashMap::new(),
             worktree_health_by_session: HashMap::new(),
             global_handoff_backlog_leads: 0,
@@ -4220,6 +9137,7 @@ diff --git a/src/next.rs b/src/next.rs
             selected_messages: Vec::new(),
             selected_parent_session: None,
             selected_child_sessions: Vec::new(),
+            focused_delegate_session_id: None,
             selected_team_summary: None,
             selected_route_preview: None,
             logs: Vec::new(),
@@ -4229,14 +9147,31 @@ diff --git a/src/next.rs b/src/next.rs
             selected_conflict_protocol: None,
             selected_merge_readiness: None,
             output_mode: OutputMode::SessionOutput,
+            output_filter: OutputFilter::All,
+            output_time_filter: OutputTimeFilter::AllTime,
+            timeline_event_filter: TimelineEventFilter::All,
+            timeline_scope: SearchScope::SelectedSession,
             selected_pane: Pane::Sessions,
             selected_session,
             show_help: false,
             operator_note: None,
+            pane_command_mode: false,
             output_follow: true,
             output_scroll_offset: 0,
             last_output_height: 0,
+            metrics_scroll_offset: 0,
+            last_metrics_height: 0,
+            collapsed_panes: HashSet::new(),
+            search_input: None,
+            spawn_input: None,
+            search_query: None,
+            search_scope: SearchScope::SelectedSession,
+            search_agent_filter: SearchAgentFilter::AllAgents,
+            search_matches: Vec::new(),
+            selected_search_match: 0,
             session_table_state,
+            last_cost_metrics_signature: None,
+            last_budget_alert_state: BudgetState::Normal,
         }
     }
 
@@ -4255,8 +9190,12 @@ diff --git a/src/next.rs b/src/next.rs
             auto_merge_ready_worktrees: false,
             cost_budget_usd: 10.0,
             token_budget: 500_000,
+            budget_alert_thresholds: crate::config::Config::BUDGET_ALERT_THRESHOLDS,
             theme: Theme::Dark,
             pane_layout: PaneLayout::Horizontal,
+            pane_navigation: Default::default(),
+            linear_pane_size_percent: 35,
+            grid_pane_size_percent: 50,
             risk_thresholds: Config::RISK_THRESHOLDS,
         }
     }
@@ -4309,6 +9248,8 @@ diff --git a/src/next.rs b/src/next.rs
             created_at: Utc::now(),
             updated_at: Utc::now(),
             metrics: SessionMetrics {
+                input_tokens: tokens_used.saturating_mul(3) / 4,
+                output_tokens: tokens_used / 4,
                 tokens_used,
                 tool_calls: 4,
                 files_changed: 2,
@@ -4331,6 +9272,8 @@ diff --git a/src/next.rs b/src/next.rs
             created_at: now,
             updated_at: now,
             metrics: SessionMetrics {
+                input_tokens: tokens_used.saturating_mul(3) / 4,
+                output_tokens: tokens_used / 4,
                 tokens_used,
                 tool_calls: 0,
                 files_changed: 0,
