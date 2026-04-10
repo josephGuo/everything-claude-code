@@ -1,13 +1,17 @@
 mod comms;
 mod config;
+mod notifications;
 mod observability;
 mod session;
 mod tui;
 mod worktree;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -52,6 +56,9 @@ enum Commands {
         /// Agent type (claude, codex, custom)
         #[arg(short, long, default_value = "claude")]
         agent: String,
+        /// Agent profile defined in ecc2.toml
+        #[arg(long)]
+        profile: Option<String>,
         #[command(flatten)]
         worktree: WorktreePolicyArgs,
         /// Source session to delegate from
@@ -68,8 +75,25 @@ enum Commands {
         /// Agent type (claude, codex, custom)
         #[arg(short, long, default_value = "claude")]
         agent: String,
+        /// Agent profile defined in ecc2.toml
+        #[arg(long)]
+        profile: Option<String>,
         #[command(flatten)]
         worktree: WorktreePolicyArgs,
+    },
+    /// Launch a named orchestration template
+    Template {
+        /// Template name defined in ecc2.toml
+        name: String,
+        /// Optional task injected into the template context
+        #[arg(short, long)]
+        task: Option<String>,
+        /// Source session to delegate the template from
+        #[arg(long)]
+        from_session: Option<String>,
+        /// Template variables in key=value form
+        #[arg(long = "var")]
+        vars: Vec<String>,
     },
     /// Route work to an existing delegate when possible, otherwise spawn a new one
     Assign {
@@ -81,6 +105,9 @@ enum Commands {
         /// Agent type (claude, codex, custom)
         #[arg(short, long, default_value = "claude")]
         agent: String,
+        /// Agent profile defined in ecc2.toml
+        #[arg(long)]
+        profile: Option<String>,
         #[command(flatten)]
         worktree: WorktreePolicyArgs,
     },
@@ -244,11 +271,56 @@ enum Commands {
         #[arg(long)]
         keep_worktree: bool,
     },
+    /// Show the merge queue for inactive worktrees and any branch-to-branch blockers
+    MergeQueue {
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+        /// Process the queue, auto-rebasing clean blocked worktrees and merging what becomes ready
+        #[arg(long)]
+        apply: bool,
+    },
     /// Prune worktrees for inactive sessions and report any active sessions still holding one
     PruneWorktrees {
         /// Emit machine-readable JSON instead of the human summary
         #[arg(long)]
         json: bool,
+    },
+    /// Log a significant agent decision for auditability
+    LogDecision {
+        /// Session ID or alias. Omit to log against the latest session.
+        session_id: Option<String>,
+        /// The chosen decision or direction
+        #[arg(long)]
+        decision: String,
+        /// Why the agent made this choice
+        #[arg(long)]
+        reasoning: String,
+        /// Alternative considered and rejected; repeat for multiple entries
+        #[arg(long = "alternative")]
+        alternatives: Vec<String>,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show recent decision-log entries
+    Decisions {
+        /// Session ID or alias. Omit to read the latest session.
+        session_id: Option<String>,
+        /// Show decision log entries across all sessions
+        #[arg(long)]
+        all: bool,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+        /// Maximum decision-log entries to return
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Read and write the shared context graph
+    Graph {
+        #[command(subcommand)]
+        command: GraphCommands,
     },
     /// Export sessions, tool spans, and metrics in OTLP-compatible JSON
     ExportOtel {
@@ -313,6 +385,177 @@ enum MessageCommands {
     },
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum GraphCommands {
+    /// Create or update a graph entity
+    AddEntity {
+        /// Optional source session ID or alias for provenance
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Entity type such as file, function, type, or decision
+        #[arg(long = "type")]
+        entity_type: String,
+        /// Stable entity name
+        #[arg(long)]
+        name: String,
+        /// Optional path associated with the entity
+        #[arg(long)]
+        path: Option<String>,
+        /// Short human summary
+        #[arg(long, default_value = "")]
+        summary: String,
+        /// Metadata in key=value form
+        #[arg(long = "meta")]
+        metadata: Vec<String>,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create or update a relation between two entities
+    Link {
+        /// Optional source session ID or alias for provenance
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Source entity ID
+        #[arg(long)]
+        from: i64,
+        /// Target entity ID
+        #[arg(long)]
+        to: i64,
+        /// Relation type such as references, defines, or depends_on
+        #[arg(long)]
+        relation: String,
+        /// Short human summary
+        #[arg(long, default_value = "")]
+        summary: String,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// List entities in the shared context graph
+    Entities {
+        /// Filter by source session ID or alias
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Filter by entity type
+        #[arg(long = "type")]
+        entity_type: Option<String>,
+        /// Maximum entities to return
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// List relations in the shared context graph
+    Relations {
+        /// Filter to relations touching a specific entity ID
+        #[arg(long)]
+        entity_id: Option<i64>,
+        /// Maximum relations to return
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record an observation against a context graph entity
+    AddObservation {
+        /// Optional source session ID or alias for provenance
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Entity ID
+        #[arg(long)]
+        entity_id: i64,
+        /// Observation type such as completion_summary, incident_note, or reminder
+        #[arg(long = "type")]
+        observation_type: String,
+        /// Observation summary
+        #[arg(long)]
+        summary: String,
+        /// Details in key=value form
+        #[arg(long = "detail")]
+        details: Vec<String>,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// List observations in the shared context graph
+    Observations {
+        /// Filter to observations for a specific entity ID
+        #[arg(long)]
+        entity_id: Option<i64>,
+        /// Maximum observations to return
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compact stored observations in the shared context graph
+    Compact {
+        /// Filter by source session ID or alias
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Maximum observations to retain per entity after compaction
+        #[arg(long, default_value_t = 12)]
+        keep_observations_per_entity: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import external memory from a configured connector
+    ConnectorSync {
+        /// Connector name from ecc2.toml
+        name: String,
+        /// Maximum non-empty records to process
+        #[arg(long, default_value_t = 256)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recall relevant context graph entities for a query
+    Recall {
+        /// Filter by source session ID or alias
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Natural-language query used for recall scoring
+        query: String,
+        /// Maximum entities to return
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one entity plus its incoming and outgoing relations
+    Show {
+        /// Entity ID
+        entity_id: i64,
+        /// Maximum incoming/outgoing relations to return
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Backfill the context graph from existing decisions and file activity
+    Sync {
+        /// Source session ID or alias. Omit to backfill the latest session.
+        session_id: Option<String>,
+        /// Backfill across all sessions
+        #[arg(long)]
+        all: bool,
+        /// Maximum decisions and file events to scan per session
+        #[arg(long, default_value_t = 64)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum MessageKindArg {
     Handoff,
@@ -320,6 +563,29 @@ enum MessageKindArg {
     Response,
     Completed,
     Conflict,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphConnectorSyncStats {
+    connector_name: String,
+    records_read: usize,
+    entities_upserted: usize,
+    observations_added: usize,
+    skipped_records: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct JsonlMemoryConnectorRecord {
+    session_id: Option<String>,
+    entity_type: Option<String>,
+    entity_name: String,
+    path: Option<String>,
+    entity_summary: Option<String>,
+    metadata: BTreeMap<String, String>,
+    observation_type: Option<String>,
+    summary: String,
+    details: BTreeMap<String, String>,
 }
 
 #[tokio::main]
@@ -340,14 +606,50 @@ async fn main() -> Result<()> {
         Some(Commands::Start {
             task,
             agent,
+            profile,
             worktree,
             from_session,
         }) => {
             let use_worktree = worktree.resolve(&cfg);
-            let session_id =
-                session::manager::create_session(&db, &cfg, &task, &agent, use_worktree).await?;
-            if let Some(from_session) = from_session {
-                let from_id = resolve_session_id(&db, &from_session)?;
+            let source = if let Some(from_session) = from_session.as_ref() {
+                let from_id = resolve_session_id(&db, from_session)?;
+                Some(
+                    db.get_session(&from_id)?
+                        .ok_or_else(|| anyhow::anyhow!("Session not found: {from_id}"))?,
+                )
+            } else {
+                None
+            };
+            let grouping = session::SessionGrouping {
+                project: source.as_ref().map(|session| session.project.clone()),
+                task_group: source.as_ref().map(|session| session.task_group.clone()),
+            };
+            let session_id = if let Some(source) = source.as_ref() {
+                session::manager::create_session_from_source_with_profile_and_grouping(
+                    &db,
+                    &cfg,
+                    &task,
+                    &agent,
+                    use_worktree,
+                    profile.as_deref(),
+                    &source.id,
+                    grouping,
+                )
+                .await?
+            } else {
+                session::manager::create_session_with_profile_and_grouping(
+                    &db,
+                    &cfg,
+                    &task,
+                    &agent,
+                    use_worktree,
+                    profile.as_deref(),
+                    grouping,
+                )
+                .await?
+            };
+            if let Some(source) = source {
+                let from_id = source.id;
                 send_handoff_message(&db, &from_id, &session_id)?;
             }
             println!("Session started: {session_id}");
@@ -356,6 +658,7 @@ async fn main() -> Result<()> {
             from_session,
             task,
             agent,
+            profile,
             worktree,
         }) => {
             let use_worktree = worktree.resolve(&cfg);
@@ -372,7 +675,20 @@ async fn main() -> Result<()> {
             });
 
             let session_id =
-                session::manager::create_session(&db, &cfg, &task, &agent, use_worktree).await?;
+                session::manager::create_session_from_source_with_profile_and_grouping(
+                    &db,
+                    &cfg,
+                    &task,
+                    &agent,
+                    use_worktree,
+                    profile.as_deref(),
+                    &source.id,
+                    session::SessionGrouping {
+                        project: Some(source.project.clone()),
+                        task_group: Some(source.task_group.clone()),
+                    },
+                )
+                .await?;
             send_handoff_message(&db, &source.id, &session_id)?;
             println!(
                 "Delegated session started: {} <- {}",
@@ -380,17 +696,63 @@ async fn main() -> Result<()> {
                 short_session(&source.id)
             );
         }
+        Some(Commands::Template {
+            name,
+            task,
+            from_session,
+            vars,
+        }) => {
+            let source_session_id = from_session
+                .as_deref()
+                .map(|session_id| resolve_session_id(&db, session_id))
+                .transpose()?;
+            let outcome = session::manager::launch_orchestration_template(
+                &db,
+                &cfg,
+                &name,
+                source_session_id.as_deref(),
+                task.as_deref(),
+                parse_template_vars(&vars)?,
+            )
+            .await?;
+            println!(
+                "Template launched: {} ({} step{})",
+                outcome.template_name,
+                outcome.created.len(),
+                if outcome.created.len() == 1 { "" } else { "s" }
+            );
+            if let Some(anchor_session_id) = outcome.anchor_session_id.as_deref() {
+                println!("Anchor session: {}", short_session(anchor_session_id));
+            }
+            for step in outcome.created {
+                println!(
+                    "- {} -> {} | {}",
+                    step.step_name,
+                    short_session(&step.session_id),
+                    step.task
+                );
+            }
+        }
         Some(Commands::Assign {
             from_session,
             task,
             agent,
+            profile,
             worktree,
         }) => {
             let use_worktree = worktree.resolve(&cfg);
             let lead_id = resolve_session_id(&db, &from_session)?;
-            let outcome =
-                session::manager::assign_session(&db, &cfg, &lead_id, &task, &agent, use_worktree)
-                    .await?;
+            let outcome = session::manager::assign_session_with_profile_and_grouping(
+                &db,
+                &cfg,
+                &lead_id,
+                &task,
+                &agent,
+                use_worktree,
+                profile.as_deref(),
+                session::SessionGrouping::default(),
+            )
+            .await?;
             if session::manager::assignment_action_routes_work(outcome.action) {
                 println!(
                     "Assignment routed: {} -> {} ({})",
@@ -808,6 +1170,23 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::MergeQueue { json, apply }) => {
+            if apply {
+                let outcome = session::manager::process_merge_queue(&db).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!("{}", format_bulk_worktree_merge_human(&outcome));
+                }
+            } else {
+                let report = session::manager::build_merge_queue(&db)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_merge_queue_human(&report));
+                }
+            }
+        }
         Some(Commands::PruneWorktrees { json }) => {
             let outcome = session::manager::prune_inactive_worktrees(&db, &cfg).await?;
             if json {
@@ -816,6 +1195,275 @@ async fn main() -> Result<()> {
                 println!("{}", format_prune_worktrees_human(&outcome));
             }
         }
+        Some(Commands::LogDecision {
+            session_id,
+            decision,
+            reasoning,
+            alternatives,
+            json,
+        }) => {
+            let resolved_id = resolve_session_id(&db, session_id.as_deref().unwrap_or("latest"))?;
+            let entry = db.insert_decision(&resolved_id, &decision, &alternatives, &reasoning)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entry)?);
+            } else {
+                println!("{}", format_logged_decision_human(&entry));
+            }
+        }
+        Some(Commands::Decisions {
+            session_id,
+            all,
+            json,
+            limit,
+        }) => {
+            if all && session_id.is_some() {
+                return Err(anyhow::anyhow!(
+                    "decisions does not accept a session ID when --all is set"
+                ));
+            }
+            let entries = if all {
+                db.list_decisions(limit)?
+            } else {
+                let resolved_id =
+                    resolve_session_id(&db, session_id.as_deref().unwrap_or("latest"))?;
+                db.list_decisions_for_session(&resolved_id, limit)?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                println!("{}", format_decisions_human(&entries, all));
+            }
+        }
+        Some(Commands::Graph { command }) => match command {
+            GraphCommands::AddEntity {
+                session_id,
+                entity_type,
+                name,
+                path,
+                summary,
+                metadata,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let metadata = parse_key_value_pairs(&metadata, "graph metadata")?;
+                let entity = db.upsert_context_entity(
+                    resolved_session_id.as_deref(),
+                    &entity_type,
+                    &name,
+                    path.as_deref(),
+                    &summary,
+                    &metadata,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entity)?);
+                } else {
+                    println!("{}", format_graph_entity_human(&entity));
+                }
+            }
+            GraphCommands::Link {
+                session_id,
+                from,
+                to,
+                relation,
+                summary,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let relation = db.upsert_context_relation(
+                    resolved_session_id.as_deref(),
+                    from,
+                    to,
+                    &relation,
+                    &summary,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&relation)?);
+                } else {
+                    println!("{}", format_graph_relation_human(&relation));
+                }
+            }
+            GraphCommands::Entities {
+                session_id,
+                entity_type,
+                limit,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let entities = db.list_context_entities(
+                    resolved_session_id.as_deref(),
+                    entity_type.as_deref(),
+                    limit,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entities)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_graph_entities_human(&entities, resolved_session_id.is_some())
+                    );
+                }
+            }
+            GraphCommands::Relations {
+                entity_id,
+                limit,
+                json,
+            } => {
+                let relations = db.list_context_relations(entity_id, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&relations)?);
+                } else {
+                    println!("{}", format_graph_relations_human(&relations));
+                }
+            }
+            GraphCommands::AddObservation {
+                session_id,
+                entity_id,
+                observation_type,
+                summary,
+                details,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let details = parse_key_value_pairs(&details, "graph observation details")?;
+                let observation = db.add_context_observation(
+                    resolved_session_id.as_deref(),
+                    entity_id,
+                    &observation_type,
+                    &summary,
+                    &details,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&observation)?);
+                } else {
+                    println!("{}", format_graph_observation_human(&observation));
+                }
+            }
+            GraphCommands::Observations {
+                entity_id,
+                limit,
+                json,
+            } => {
+                let observations = db.list_context_observations(entity_id, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&observations)?);
+                } else {
+                    println!("{}", format_graph_observations_human(&observations));
+                }
+            }
+            GraphCommands::Compact {
+                session_id,
+                keep_observations_per_entity,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let stats = db.compact_context_graph(
+                    resolved_session_id.as_deref(),
+                    keep_observations_per_entity,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_graph_compaction_stats_human(
+                            &stats,
+                            resolved_session_id.as_deref(),
+                            keep_observations_per_entity,
+                        )
+                    );
+                }
+            }
+            GraphCommands::ConnectorSync { name, limit, json } => {
+                let stats = sync_memory_connector(&db, &cfg, &name, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats)?);
+                } else {
+                    println!("{}", format_graph_connector_sync_stats_human(&stats));
+                }
+            }
+            GraphCommands::Recall {
+                session_id,
+                query,
+                limit,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let entries =
+                    db.recall_context_entities(resolved_session_id.as_deref(), &query, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_graph_recall_human(&entries, resolved_session_id.as_deref(), &query)
+                    );
+                }
+            }
+            GraphCommands::Show {
+                entity_id,
+                limit,
+                json,
+            } => {
+                let detail = db
+                    .get_context_entity_detail(entity_id, limit)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Context graph entity not found: {entity_id}")
+                    })?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&detail)?);
+                } else {
+                    println!("{}", format_graph_entity_detail_human(&detail));
+                }
+            }
+            GraphCommands::Sync {
+                session_id,
+                all,
+                limit,
+                json,
+            } => {
+                if all && session_id.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "graph sync does not accept a session ID when --all is set"
+                    ));
+                }
+                sync_runtime_session_metrics(&db, &cfg)?;
+                let resolved_session_id = if all {
+                    None
+                } else {
+                    Some(resolve_session_id(
+                        &db,
+                        session_id.as_deref().unwrap_or("latest"),
+                    )?)
+                };
+                let stats = db.sync_context_graph_history(resolved_session_id.as_deref(), limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_graph_sync_stats_human(&stats, resolved_session_id.as_deref())
+                    );
+                }
+            }
+        },
         Some(Commands::ExportOtel { session_id, output }) => {
             sync_runtime_session_metrics(&db, &cfg)?;
             let resolved_session_id = session_id
@@ -926,6 +1574,133 @@ fn sync_runtime_session_metrics(
     let _ = session::manager::enforce_session_heartbeats(db, cfg)?;
     let _ = session::manager::enforce_budget_hard_limits(db, cfg)?;
     Ok(())
+}
+
+fn sync_memory_connector(
+    db: &session::store::StateStore,
+    cfg: &config::Config,
+    name: &str,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    let connector = cfg
+        .memory_connectors
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown memory connector: {name}"))?;
+
+    match connector {
+        config::MemoryConnectorConfig::JsonlFile(settings) => {
+            sync_jsonl_memory_connector(db, name, settings, limit)
+        }
+    }
+}
+
+fn sync_jsonl_memory_connector(
+    db: &session::store::StateStore,
+    name: &str,
+    settings: &config::MemoryConnectorJsonlFileConfig,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    if settings.path.as_os_str().is_empty() {
+        anyhow::bail!("memory connector {name} has no path configured");
+    }
+
+    let default_session_id = settings
+        .session_id
+        .as_deref()
+        .map(|value| resolve_session_id(db, value))
+        .transpose()?;
+    let file = File::open(&settings.path)
+        .with_context(|| format!("open memory connector file {}", settings.path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut stats = GraphConnectorSyncStats {
+        connector_name: name.to_string(),
+        ..Default::default()
+    };
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if stats.records_read >= limit {
+            break;
+        }
+        stats.records_read += 1;
+
+        let record: JsonlMemoryConnectorRecord = match serde_json::from_str(trimmed) {
+            Ok(record) => record,
+            Err(_) => {
+                stats.skipped_records += 1;
+                continue;
+            }
+        };
+
+        let session_id = match record.session_id.as_deref() {
+            Some(value) => match resolve_session_id(db, value) {
+                Ok(resolved) => Some(resolved),
+                Err(_) => {
+                    stats.skipped_records += 1;
+                    continue;
+                }
+            },
+            None => default_session_id.clone(),
+        };
+        let entity_type = record
+            .entity_type
+            .as_deref()
+            .or(settings.default_entity_type.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let observation_type = record
+            .observation_type
+            .as_deref()
+            .or(settings.default_observation_type.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let entity_name = record.entity_name.trim();
+        let summary = record.summary.trim();
+
+        let Some(entity_type) = entity_type else {
+            stats.skipped_records += 1;
+            continue;
+        };
+        let Some(observation_type) = observation_type else {
+            stats.skipped_records += 1;
+            continue;
+        };
+        if entity_name.is_empty() || summary.is_empty() {
+            stats.skipped_records += 1;
+            continue;
+        }
+
+        let entity_summary = record
+            .entity_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(summary);
+        let entity = db.upsert_context_entity(
+            session_id.as_deref(),
+            entity_type,
+            entity_name,
+            record.path.as_deref(),
+            entity_summary,
+            &record.metadata,
+        )?;
+        db.add_context_observation(
+            session_id.as_deref(),
+            entity.id,
+            observation_type,
+            summary,
+            &record.details,
+        )?;
+        stats.entities_upserted += 1;
+        stats.observations_added += 1;
+    }
+
+    Ok(stats)
 }
 
 fn build_message(
@@ -1462,6 +2237,26 @@ fn format_bulk_worktree_merge_human(
         ));
     }
 
+    if !outcome.rebased.is_empty() {
+        lines.push(format!(
+            "Rebased {} blocked worktree(s) onto their base branch",
+            outcome.rebased.len()
+        ));
+        for rebased in &outcome.rebased {
+            lines.push(format!(
+                "- rebased {} onto {} for {}{}",
+                rebased.branch,
+                rebased.base_branch,
+                short_session(&rebased.session_id),
+                if rebased.already_up_to_date {
+                    " (already up to date)"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+
     if !outcome.active_with_worktree_ids.is_empty() {
         lines.push(format!(
             "Skipped {} active worktree session(s)",
@@ -1478,6 +2273,12 @@ fn format_bulk_worktree_merge_human(
         lines.push(format!(
             "Skipped {} dirty worktree(s)",
             outcome.dirty_worktree_ids.len()
+        ));
+    }
+    if !outcome.blocked_by_queue_session_ids.is_empty() {
+        lines.push(format!(
+            "Blocked {} worktree(s) on remaining queue conflicts",
+            outcome.blocked_by_queue_session_ids.len()
         ));
     }
     if !outcome.failures.is_empty() {
@@ -1553,6 +2354,422 @@ fn format_prune_worktrees_human(outcome: &session::manager::WorktreePruneOutcome
         ));
         for session_id in &outcome.retained_session_ids {
             lines.push(format!("- retained {}", short_session(session_id)));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_logged_decision_human(entry: &session::DecisionLogEntry) -> String {
+    let mut lines = vec![
+        format!("Logged decision for {}", short_session(&entry.session_id)),
+        format!("Decision: {}", entry.decision),
+        format!("Why: {}", entry.reasoning),
+    ];
+
+    if entry.alternatives.is_empty() {
+        lines.push("Alternatives: none recorded".to_string());
+    } else {
+        lines.push("Alternatives:".to_string());
+        for alternative in &entry.alternatives {
+            lines.push(format!("- {alternative}"));
+        }
+    }
+
+    lines.push(format!(
+        "Recorded at: {}",
+        entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+    lines.join("\n")
+}
+
+fn format_decisions_human(entries: &[session::DecisionLogEntry], include_session: bool) -> String {
+    if entries.is_empty() {
+        return if include_session {
+            "No decision-log entries across all sessions yet.".to_string()
+        } else {
+            "No decision-log entries for this session yet.".to_string()
+        };
+    }
+
+    let mut lines = vec![format!("Decision log: {} entries", entries.len())];
+    for entry in entries {
+        let prefix = if include_session {
+            format!("{} | ", short_session(&entry.session_id))
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "- [{}] {prefix}{}",
+            entry.timestamp.format("%H:%M:%S"),
+            entry.decision
+        ));
+        lines.push(format!("  why {}", entry.reasoning));
+        if entry.alternatives.is_empty() {
+            lines.push("  alternatives none recorded".to_string());
+        } else {
+            for alternative in &entry.alternatives {
+                lines.push(format!("  alternative {alternative}"));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_graph_entity_human(entity: &session::ContextGraphEntity) -> String {
+    let mut lines = vec![
+        format!("Context graph entity #{}", entity.id),
+        format!("Type: {}", entity.entity_type),
+        format!("Name: {}", entity.name),
+    ];
+    if let Some(path) = &entity.path {
+        lines.push(format!("Path: {path}"));
+    }
+    if let Some(session_id) = &entity.session_id {
+        lines.push(format!("Session: {}", short_session(session_id)));
+    }
+    if entity.summary.is_empty() {
+        lines.push("Summary: none recorded".to_string());
+    } else {
+        lines.push(format!("Summary: {}", entity.summary));
+    }
+    if entity.metadata.is_empty() {
+        lines.push("Metadata: none recorded".to_string());
+    } else {
+        lines.push("Metadata:".to_string());
+        for (key, value) in &entity.metadata {
+            lines.push(format!("- {key}={value}"));
+        }
+    }
+    lines.push(format!(
+        "Updated: {}",
+        entity.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+    lines.join("\n")
+}
+
+fn format_graph_entities_human(
+    entities: &[session::ContextGraphEntity],
+    include_session: bool,
+) -> String {
+    if entities.is_empty() {
+        return "No context graph entities found.".to_string();
+    }
+
+    let mut lines = vec![format!("Context graph entities: {}", entities.len())];
+    for entity in entities {
+        let mut line = format!("- #{} [{}] {}", entity.id, entity.entity_type, entity.name);
+        if include_session {
+            line.push_str(&format!(
+                " | {}",
+                entity
+                    .session_id
+                    .as_deref()
+                    .map(short_session)
+                    .unwrap_or_else(|| "global".to_string())
+            ));
+        }
+        if let Some(path) = &entity.path {
+            line.push_str(&format!(" | {path}"));
+        }
+        lines.push(line);
+        if !entity.summary.is_empty() {
+            lines.push(format!("  summary {}", entity.summary));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_graph_relation_human(relation: &session::ContextGraphRelation) -> String {
+    let mut lines = vec![
+        format!("Context graph relation #{}", relation.id),
+        format!(
+            "Edge: #{} [{}] {} -> #{} [{}] {}",
+            relation.from_entity_id,
+            relation.from_entity_type,
+            relation.from_entity_name,
+            relation.to_entity_id,
+            relation.to_entity_type,
+            relation.to_entity_name
+        ),
+        format!("Relation: {}", relation.relation_type),
+    ];
+    if let Some(session_id) = &relation.session_id {
+        lines.push(format!("Session: {}", short_session(session_id)));
+    }
+    if relation.summary.is_empty() {
+        lines.push("Summary: none recorded".to_string());
+    } else {
+        lines.push(format!("Summary: {}", relation.summary));
+    }
+    lines.push(format!(
+        "Created: {}",
+        relation.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+    lines.join("\n")
+}
+
+fn format_graph_relations_human(relations: &[session::ContextGraphRelation]) -> String {
+    if relations.is_empty() {
+        return "No context graph relations found.".to_string();
+    }
+
+    let mut lines = vec![format!("Context graph relations: {}", relations.len())];
+    for relation in relations {
+        lines.push(format!(
+            "- #{} {} -> {} [{}]",
+            relation.id, relation.from_entity_name, relation.to_entity_name, relation.relation_type
+        ));
+        if !relation.summary.is_empty() {
+            lines.push(format!("  summary {}", relation.summary));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_graph_observation_human(observation: &session::ContextGraphObservation) -> String {
+    let mut lines = vec![
+        format!("Context graph observation #{}", observation.id),
+        format!(
+            "Entity: #{} [{}] {}",
+            observation.entity_id, observation.entity_type, observation.entity_name
+        ),
+        format!("Type: {}", observation.observation_type),
+        format!("Summary: {}", observation.summary),
+    ];
+    if let Some(session_id) = observation.session_id.as_deref() {
+        lines.push(format!("Session: {}", short_session(session_id)));
+    }
+    if observation.details.is_empty() {
+        lines.push("Details: none recorded".to_string());
+    } else {
+        lines.push("Details:".to_string());
+        for (key, value) in &observation.details {
+            lines.push(format!("- {key}={value}"));
+        }
+    }
+    lines.push(format!(
+        "Created: {}",
+        observation.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+    lines.join("\n")
+}
+
+fn format_graph_observations_human(observations: &[session::ContextGraphObservation]) -> String {
+    if observations.is_empty() {
+        return "No context graph observations found.".to_string();
+    }
+
+    let mut lines = vec![format!(
+        "Context graph observations: {}",
+        observations.len()
+    )];
+    for observation in observations {
+        let mut line = format!(
+            "- #{} [{}] {}",
+            observation.id, observation.observation_type, observation.entity_name
+        );
+        if let Some(session_id) = observation.session_id.as_deref() {
+            line.push_str(&format!(" | {}", short_session(session_id)));
+        }
+        lines.push(line);
+        lines.push(format!("  summary {}", observation.summary));
+    }
+
+    lines.join("\n")
+}
+
+fn format_graph_recall_human(
+    entries: &[session::ContextGraphRecallEntry],
+    session_id: Option<&str>,
+    query: &str,
+) -> String {
+    if entries.is_empty() {
+        return format!("No relevant context graph entities found for query: {query}");
+    }
+
+    let scope = session_id
+        .map(short_session)
+        .unwrap_or_else(|| "all sessions".to_string());
+    let mut lines = vec![format!(
+        "Relevant memory: {} entries for \"{}\" ({scope})",
+        entries.len(),
+        query
+    )];
+    for entry in entries {
+        let mut line = format!(
+            "- #{} [{}] {} | score {} | relations {} | observations {}",
+            entry.entity.id,
+            entry.entity.entity_type,
+            entry.entity.name,
+            entry.score,
+            entry.relation_count,
+            entry.observation_count
+        );
+        if let Some(session_id) = entry.entity.session_id.as_deref() {
+            line.push_str(&format!(" | {}", short_session(session_id)));
+        }
+        lines.push(line);
+        if !entry.matched_terms.is_empty() {
+            lines.push(format!("  matches {}", entry.matched_terms.join(", ")));
+        }
+        if let Some(path) = entry.entity.path.as_deref() {
+            lines.push(format!("  path {path}"));
+        }
+        if !entry.entity.summary.is_empty() {
+            lines.push(format!("  summary {}", entry.entity.summary));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_graph_compaction_stats_human(
+    stats: &session::ContextGraphCompactionStats,
+    session_id: Option<&str>,
+    keep_observations_per_entity: usize,
+) -> String {
+    let scope = session_id
+        .map(short_session)
+        .unwrap_or_else(|| "all sessions".to_string());
+    [
+        format!(
+            "Context graph compaction complete for {scope} (keep {keep_observations_per_entity} observations per entity)"
+        ),
+        format!("- entities scanned {}", stats.entities_scanned),
+        format!(
+            "- duplicate observations deleted {}",
+            stats.duplicate_observations_deleted
+        ),
+        format!(
+            "- overflow observations deleted {}",
+            stats.overflow_observations_deleted
+        ),
+        format!("- observations retained {}", stats.observations_retained),
+    ]
+    .join("\n")
+}
+
+fn format_graph_connector_sync_stats_human(stats: &GraphConnectorSyncStats) -> String {
+    [
+        format!("Memory connector sync complete: {}", stats.connector_name),
+        format!("- records read {}", stats.records_read),
+        format!("- entities upserted {}", stats.entities_upserted),
+        format!("- observations added {}", stats.observations_added),
+        format!("- skipped records {}", stats.skipped_records),
+    ]
+    .join("\n")
+}
+
+fn format_graph_entity_detail_human(detail: &session::ContextGraphEntityDetail) -> String {
+    let mut lines = vec![format_graph_entity_human(&detail.entity)];
+    lines.push(String::new());
+    lines.push(format!("Outgoing relations: {}", detail.outgoing.len()));
+    if detail.outgoing.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for relation in &detail.outgoing {
+            lines.push(format!(
+                "- [{}] {} -> #{} {}",
+                relation.relation_type,
+                detail.entity.name,
+                relation.to_entity_id,
+                relation.to_entity_name
+            ));
+            if !relation.summary.is_empty() {
+                lines.push(format!("  summary {}", relation.summary));
+            }
+        }
+    }
+    lines.push(format!("Incoming relations: {}", detail.incoming.len()));
+    if detail.incoming.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for relation in &detail.incoming {
+            lines.push(format!(
+                "- [{}] #{} {} -> {}",
+                relation.relation_type,
+                relation.from_entity_id,
+                relation.from_entity_name,
+                detail.entity.name
+            ));
+            if !relation.summary.is_empty() {
+                lines.push(format!("  summary {}", relation.summary));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_graph_sync_stats_human(
+    stats: &session::ContextGraphSyncStats,
+    session_id: Option<&str>,
+) -> String {
+    let scope = session_id
+        .map(short_session)
+        .unwrap_or_else(|| "all sessions".to_string());
+    vec![
+        format!("Context graph sync complete for {scope}"),
+        format!("- sessions scanned {}", stats.sessions_scanned),
+        format!("- decisions processed {}", stats.decisions_processed),
+        format!("- file events processed {}", stats.file_events_processed),
+        format!("- messages processed {}", stats.messages_processed),
+    ]
+    .join("\n")
+}
+
+fn format_merge_queue_human(report: &session::manager::MergeQueueReport) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Merge queue: {} ready / {} blocked",
+        report.ready_entries.len(),
+        report.blocked_entries.len()
+    ));
+
+    if report.ready_entries.is_empty() {
+        lines.push("No merge-ready worktrees queued".to_string());
+    } else {
+        lines.push("Ready".to_string());
+        for entry in &report.ready_entries {
+            lines.push(format!(
+                "- #{} {} [{}] | {} / {} | {}",
+                entry.queue_position.unwrap_or(0),
+                entry.session_id,
+                entry.branch,
+                entry.project,
+                entry.task_group,
+                entry.task
+            ));
+        }
+    }
+
+    if !report.blocked_entries.is_empty() {
+        lines.push(String::new());
+        lines.push("Blocked".to_string());
+        for entry in &report.blocked_entries {
+            lines.push(format!(
+                "- {} [{}] | {} / {} | {}",
+                entry.session_id,
+                entry.branch,
+                entry.project,
+                entry.task_group,
+                entry.suggested_action
+            ));
+            for blocker in entry.blocked_by.iter().take(2) {
+                lines.push(format!(
+                    "  blocker {} [{}] | {}",
+                    blocker.session_id, blocker.branch, blocker.summary
+                ));
+                for conflict in blocker.conflicts.iter().take(3) {
+                    lines.push(format!("    conflict {conflict}"));
+                }
+                if let Some(preview) = blocker.conflicting_patch_preview.as_ref() {
+                    for line in preview.lines().take(6) {
+                        lines.push(format!("    {}", line));
+                    }
+                }
+            }
         }
     }
 
@@ -1870,6 +3087,26 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
     )
 }
 
+fn parse_template_vars(values: &[String]) -> Result<BTreeMap<String, String>> {
+    parse_key_value_pairs(values, "template vars")
+}
+
+fn parse_key_value_pairs(values: &[String], label: &str) -> Result<BTreeMap<String, String>> {
+    let mut vars = BTreeMap::new();
+    for value in values {
+        let (key, raw_value) = value
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("{label} must use key=value form: {value}"))?;
+        let key = key.trim();
+        let raw_value = raw_value.trim();
+        if key.is_empty() || raw_value.is_empty() {
+            anyhow::bail!("{label} must use non-empty key=value form: {value}");
+        }
+        vars.insert(key.to_string(), raw_value.to_string());
+    }
+    Ok(vars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1908,6 +3145,8 @@ mod tests {
         Session {
             id: id.to_string(),
             task: task.to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp/ecc"),
             state,
@@ -2116,6 +3355,83 @@ mod tests {
             }
             _ => panic!("expected delegate subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_parses_template_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "template",
+            "feature_development",
+            "--task",
+            "stabilize auth callback",
+            "--from-session",
+            "lead",
+            "--var",
+            "component=billing",
+            "--var",
+            "area=oauth",
+        ])
+        .expect("template should parse");
+
+        match cli.command {
+            Some(Commands::Template {
+                name,
+                task,
+                from_session,
+                vars,
+            }) => {
+                assert_eq!(name, "feature_development");
+                assert_eq!(task.as_deref(), Some("stabilize auth callback"));
+                assert_eq!(from_session.as_deref(), Some("lead"));
+                assert_eq!(
+                    vars,
+                    vec!["component=billing".to_string(), "area=oauth".to_string(),]
+                );
+            }
+            _ => panic!("expected template subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_template_vars_builds_map() {
+        let vars =
+            parse_template_vars(&["component=billing".to_string(), "area=oauth".to_string()])
+                .expect("template vars");
+
+        assert_eq!(
+            vars,
+            BTreeMap::from([
+                ("area".to_string(), "oauth".to_string()),
+                ("component".to_string(), "billing".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_template_vars_rejects_invalid_entries() {
+        let error = parse_template_vars(&["missing-delimiter".to_string()])
+            .expect_err("invalid template var should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("template vars must use key=value form"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_key_value_pairs_rejects_empty_values() {
+        let error = parse_key_value_pairs(&["language=".to_string()], "graph metadata")
+            .expect_err("invalid metadata should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("graph metadata must use non-empty key=value form"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -2505,6 +3821,34 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_merge_queue_json_flag() {
+        let cli = Cli::try_parse_from(["ecc", "merge-queue", "--json"])
+            .expect("merge-queue --json should parse");
+
+        match cli.command {
+            Some(Commands::MergeQueue { json, apply }) => {
+                assert!(json);
+                assert!(!apply);
+            }
+            _ => panic!("expected merge-queue subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_merge_queue_apply_flag() {
+        let cli = Cli::try_parse_from(["ecc", "merge-queue", "--apply", "--json"])
+            .expect("merge-queue --apply --json should parse");
+
+        match cli.command {
+            Some(Commands::MergeQueue { json, apply }) => {
+                assert!(json);
+                assert!(apply);
+            }
+            _ => panic!("expected merge-queue subcommand"),
+        }
+    }
+
+    #[test]
     fn format_worktree_status_human_includes_readiness_and_conflicts() {
         let report = WorktreeStatusReport {
             session_id: "deadbeefcafefeed".to_string(),
@@ -2636,6 +3980,60 @@ mod tests {
     }
 
     #[test]
+    fn format_merge_queue_human_reports_ready_and_blocked_entries() {
+        let text = format_merge_queue_human(&session::manager::MergeQueueReport {
+            ready_entries: vec![session::manager::MergeQueueEntry {
+                session_id: "alpha1234".to_string(),
+                task: "merge alpha".to_string(),
+                project: "ecc".to_string(),
+                task_group: "checkout".to_string(),
+                branch: "ecc/alpha1234".to_string(),
+                base_branch: "main".to_string(),
+                state: session::SessionState::Stopped,
+                worktree_health: worktree::WorktreeHealth::InProgress,
+                dirty: false,
+                queue_position: Some(1),
+                ready_to_merge: true,
+                blocked_by: Vec::new(),
+                suggested_action: "merge in queue order #1".to_string(),
+            }],
+            blocked_entries: vec![session::manager::MergeQueueEntry {
+                session_id: "beta5678".to_string(),
+                task: "merge beta".to_string(),
+                project: "ecc".to_string(),
+                task_group: "checkout".to_string(),
+                branch: "ecc/beta5678".to_string(),
+                base_branch: "main".to_string(),
+                state: session::SessionState::Stopped,
+                worktree_health: worktree::WorktreeHealth::InProgress,
+                dirty: false,
+                queue_position: None,
+                ready_to_merge: false,
+                blocked_by: vec![session::manager::MergeQueueBlocker {
+                    session_id: "alpha1234".to_string(),
+                    branch: "ecc/alpha1234".to_string(),
+                    state: session::SessionState::Stopped,
+                    conflicts: vec!["README.md".to_string()],
+                    summary: "merge after alpha1234 to avoid branch conflicts".to_string(),
+                    conflicting_patch_preview: Some(
+                        "--- Branch diff vs main ---\nREADME.md".to_string(),
+                    ),
+                    blocker_patch_preview: None,
+                }],
+                suggested_action: "merge after alpha1234".to_string(),
+            }],
+        });
+
+        assert!(text.contains("Merge queue: 1 ready / 1 blocked"));
+        assert!(text.contains("Ready"));
+        assert!(text.contains("#1 alpha1234"));
+        assert!(text.contains("Blocked"));
+        assert!(text.contains("beta5678"));
+        assert!(text.contains("blocker alpha1234"));
+        assert!(text.contains("conflict README.md"));
+    }
+
+    #[test]
     fn format_bulk_worktree_merge_human_reports_summary_and_skips() {
         let text = format_bulk_worktree_merge_human(&session::manager::WorktreeBulkMergeOutcome {
             merged: vec![session::manager::WorktreeMergeOutcome {
@@ -2645,9 +4043,16 @@ mod tests {
                 already_up_to_date: false,
                 cleaned_worktree: true,
             }],
+            rebased: vec![session::manager::WorktreeRebaseOutcome {
+                session_id: "rebased12345678".to_string(),
+                branch: "ecc/rebased12345678".to_string(),
+                base_branch: "main".to_string(),
+                already_up_to_date: false,
+            }],
             active_with_worktree_ids: vec!["running12345678".to_string()],
             conflicted_session_ids: vec!["conflict123456".to_string()],
             dirty_worktree_ids: vec!["dirty123456789".to_string()],
+            blocked_by_queue_session_ids: vec!["queue123456789".to_string()],
             failures: vec![session::manager::WorktreeMergeFailure {
                 session_id: "fail1234567890".to_string(),
                 reason: "base branch not checked out".to_string(),
@@ -2656,9 +4061,12 @@ mod tests {
 
         assert!(text.contains("Merged 1 ready worktree(s)"));
         assert!(text.contains("- merged ecc/deadbeefcafefeed -> main for deadbeef"));
+        assert!(text.contains("Rebased 1 blocked worktree(s) onto their base branch"));
+        assert!(text.contains("- rebased ecc/rebased12345678 onto main for rebased1"));
         assert!(text.contains("Skipped 1 active worktree session(s)"));
         assert!(text.contains("Skipped 1 conflicted worktree(s)"));
         assert!(text.contains("Skipped 1 dirty worktree(s)"));
+        assert!(text.contains("Blocked 1 worktree(s) on remaining queue conflicts"));
         assert!(text.contains("Encountered 1 merge failure(s)"));
         assert!(text.contains("- failed fail1234: base branch not checked out"));
     }
@@ -3024,6 +4432,538 @@ mod tests {
             }
             _ => panic!("expected coordination-status subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_parses_log_decision_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "log-decision",
+            "latest",
+            "--decision",
+            "Use sqlite",
+            "--reasoning",
+            "It is already embedded",
+            "--alternative",
+            "json files",
+            "--alternative",
+            "memory only",
+            "--json",
+        ])
+        .expect("log-decision should parse");
+
+        match cli.command {
+            Some(Commands::LogDecision {
+                session_id,
+                decision,
+                reasoning,
+                alternatives,
+                json,
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(decision, "Use sqlite");
+                assert_eq!(reasoning, "It is already embedded");
+                assert_eq!(alternatives, vec!["json files", "memory only"]);
+                assert!(json);
+            }
+            _ => panic!("expected log-decision subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_decisions_command() {
+        let cli = Cli::try_parse_from(["ecc", "decisions", "--all", "--limit", "5", "--json"])
+            .expect("decisions should parse");
+
+        match cli.command {
+            Some(Commands::Decisions {
+                session_id,
+                all,
+                json,
+                limit,
+            }) => {
+                assert!(session_id.is_none());
+                assert!(all);
+                assert!(json);
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected decisions subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_add_entity_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "add-entity",
+            "--session-id",
+            "latest",
+            "--type",
+            "file",
+            "--name",
+            "dashboard.rs",
+            "--path",
+            "ecc2/src/tui/dashboard.rs",
+            "--summary",
+            "Primary TUI surface",
+            "--meta",
+            "language=rust",
+            "--json",
+        ])
+        .expect("graph add-entity should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::AddEntity {
+                        session_id,
+                        entity_type,
+                        name,
+                        path,
+                        summary,
+                        metadata,
+                        json,
+                    },
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(entity_type, "file");
+                assert_eq!(name, "dashboard.rs");
+                assert_eq!(path.as_deref(), Some("ecc2/src/tui/dashboard.rs"));
+                assert_eq!(summary, "Primary TUI surface");
+                assert_eq!(metadata, vec!["language=rust"]);
+                assert!(json);
+            }
+            _ => panic!("expected graph add-entity subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_sync_command() {
+        let cli = Cli::try_parse_from(["ecc", "graph", "sync", "--all", "--limit", "12", "--json"])
+            .expect("graph sync should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::Sync {
+                        session_id,
+                        all,
+                        limit,
+                        json,
+                    },
+            }) => {
+                assert!(session_id.is_none());
+                assert!(all);
+                assert_eq!(limit, 12);
+                assert!(json);
+            }
+            _ => panic!("expected graph sync subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_recall_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "recall",
+            "--session-id",
+            "latest",
+            "--limit",
+            "4",
+            "--json",
+            "auth callback recovery",
+        ])
+        .expect("graph recall should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::Recall {
+                        session_id,
+                        query,
+                        limit,
+                        json,
+                    },
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(query, "auth callback recovery");
+                assert_eq!(limit, 4);
+                assert!(json);
+            }
+            _ => panic!("expected graph recall subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_add_observation_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "add-observation",
+            "--session-id",
+            "latest",
+            "--entity-id",
+            "7",
+            "--type",
+            "completion_summary",
+            "--summary",
+            "Finished auth callback recovery",
+            "--detail",
+            "tests_run=2",
+            "--json",
+        ])
+        .expect("graph add-observation should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::AddObservation {
+                        session_id,
+                        entity_id,
+                        observation_type,
+                        summary,
+                        details,
+                        json,
+                    },
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(entity_id, 7);
+                assert_eq!(observation_type, "completion_summary");
+                assert_eq!(summary, "Finished auth callback recovery");
+                assert_eq!(details, vec!["tests_run=2"]);
+                assert!(json);
+            }
+            _ => panic!("expected graph add-observation subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_compact_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "compact",
+            "--session-id",
+            "latest",
+            "--keep-observations-per-entity",
+            "6",
+            "--json",
+        ])
+        .expect("graph compact should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::Compact {
+                        session_id,
+                        keep_observations_per_entity,
+                        json,
+                    },
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(keep_observations_per_entity, 6);
+                assert!(json);
+            }
+            _ => panic!("expected graph compact subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_connector_sync_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "connector-sync",
+            "hermes_notes",
+            "--limit",
+            "32",
+            "--json",
+        ])
+        .expect("graph connector-sync should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command: GraphCommands::ConnectorSync { name, limit, json },
+            }) => {
+                assert_eq!(name, "hermes_notes");
+                assert_eq!(limit, 32);
+                assert!(json);
+            }
+            _ => panic!("expected graph connector-sync subcommand"),
+        }
+    }
+
+    #[test]
+    fn format_decisions_human_renders_details() {
+        let text = format_decisions_human(
+            &[session::DecisionLogEntry {
+                id: 1,
+                session_id: "sess-12345678".to_string(),
+                decision: "Use sqlite for the shared context graph".to_string(),
+                alternatives: vec!["json files".to_string(), "memory only".to_string()],
+                reasoning: "SQLite keeps the audit trail queryable.".to_string(),
+                timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-09T01:02:03Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            }],
+            true,
+        );
+
+        assert!(text.contains("Decision log: 1 entries"));
+        assert!(text.contains("sess-123"));
+        assert!(text.contains("Use sqlite for the shared context graph"));
+        assert!(text.contains("why SQLite keeps the audit trail queryable."));
+        assert!(text.contains("alternative json files"));
+        assert!(text.contains("alternative memory only"));
+    }
+
+    #[test]
+    fn format_graph_entity_detail_human_renders_relations() {
+        let detail = session::ContextGraphEntityDetail {
+            entity: session::ContextGraphEntity {
+                id: 7,
+                session_id: Some("sess-12345678".to_string()),
+                entity_type: "function".to_string(),
+                name: "render_metrics".to_string(),
+                path: Some("ecc2/src/tui/dashboard.rs".to_string()),
+                summary: "Renders the metrics pane".to_string(),
+                metadata: BTreeMap::from([("language".to_string(), "rust".to_string())]),
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                updated_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            },
+            outgoing: vec![session::ContextGraphRelation {
+                id: 9,
+                session_id: Some("sess-12345678".to_string()),
+                from_entity_id: 7,
+                from_entity_type: "function".to_string(),
+                from_entity_name: "render_metrics".to_string(),
+                to_entity_id: 10,
+                to_entity_type: "type".to_string(),
+                to_entity_name: "MetricsSnapshot".to_string(),
+                relation_type: "returns".to_string(),
+                summary: "Produces the rendered metrics model".to_string(),
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            }],
+            incoming: vec![session::ContextGraphRelation {
+                id: 8,
+                session_id: Some("sess-12345678".to_string()),
+                from_entity_id: 6,
+                from_entity_type: "file".to_string(),
+                from_entity_name: "dashboard.rs".to_string(),
+                to_entity_id: 7,
+                to_entity_type: "function".to_string(),
+                to_entity_name: "render_metrics".to_string(),
+                relation_type: "contains".to_string(),
+                summary: "Dashboard owns the render path".to_string(),
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            }],
+        };
+
+        let text = format_graph_entity_detail_human(&detail);
+        assert!(text.contains("Context graph entity #7"));
+        assert!(text.contains("Outgoing relations: 1"));
+        assert!(text.contains("[returns] render_metrics -> #10 MetricsSnapshot"));
+        assert!(text.contains("Incoming relations: 1"));
+        assert!(text.contains("[contains] #6 dashboard.rs -> render_metrics"));
+    }
+
+    #[test]
+    fn format_graph_recall_human_renders_scores_and_matches() {
+        let text = format_graph_recall_human(
+            &[session::ContextGraphRecallEntry {
+                entity: session::ContextGraphEntity {
+                    id: 11,
+                    session_id: Some("sess-12345678".to_string()),
+                    entity_type: "file".to_string(),
+                    name: "callback.ts".to_string(),
+                    path: Some("src/routes/auth/callback.ts".to_string()),
+                    summary: "Handles auth callback recovery".to_string(),
+                    metadata: BTreeMap::new(),
+                    created_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    updated_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                },
+                score: 319,
+                matched_terms: vec![
+                    "auth".to_string(),
+                    "callback".to_string(),
+                    "recovery".to_string(),
+                ],
+                relation_count: 2,
+                observation_count: 1,
+            }],
+            Some("sess-12345678"),
+            "auth callback recovery",
+        );
+
+        assert!(text.contains("Relevant memory: 1 entries"));
+        assert!(text.contains("[file] callback.ts | score 319 | relations 2 | observations 1"));
+        assert!(text.contains("matches auth, callback, recovery"));
+        assert!(text.contains("path src/routes/auth/callback.ts"));
+    }
+
+    #[test]
+    fn format_graph_observations_human_renders_summaries() {
+        let text = format_graph_observations_human(&[session::ContextGraphObservation {
+            id: 5,
+            session_id: Some("sess-12345678".to_string()),
+            entity_id: 11,
+            entity_type: "session".to_string(),
+            entity_name: "sess-12345678".to_string(),
+            observation_type: "completion_summary".to_string(),
+            summary: "Finished auth callback recovery with 2 tests".to_string(),
+            details: BTreeMap::from([("tests_run".to_string(), "2".to_string())]),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }]);
+
+        assert!(text.contains("Context graph observations: 1"));
+        assert!(text.contains("[completion_summary] sess-12345678"));
+        assert!(text.contains("summary Finished auth callback recovery with 2 tests"));
+    }
+
+    #[test]
+    fn format_graph_compaction_stats_human_renders_counts() {
+        let text = format_graph_compaction_stats_human(
+            &session::ContextGraphCompactionStats {
+                entities_scanned: 3,
+                duplicate_observations_deleted: 2,
+                overflow_observations_deleted: 4,
+                observations_retained: 9,
+            },
+            Some("sess-12345678"),
+            6,
+        );
+
+        assert!(text.contains("Context graph compaction complete for sess-123"));
+        assert!(text.contains("keep 6 observations per entity"));
+        assert!(text.contains("- entities scanned 3"));
+        assert!(text.contains("- duplicate observations deleted 2"));
+        assert!(text.contains("- overflow observations deleted 4"));
+        assert!(text.contains("- observations retained 9"));
+    }
+
+    #[test]
+    fn format_graph_connector_sync_stats_human_renders_counts() {
+        let text = format_graph_connector_sync_stats_human(&GraphConnectorSyncStats {
+            connector_name: "hermes_notes".to_string(),
+            records_read: 4,
+            entities_upserted: 3,
+            observations_added: 3,
+            skipped_records: 1,
+        });
+
+        assert!(text.contains("Memory connector sync complete: hermes_notes"));
+        assert!(text.contains("- records read 4"));
+        assert!(text.contains("- entities upserted 3"));
+        assert!(text.contains("- observations added 3"));
+        assert!(text.contains("- skipped records 1"));
+    }
+
+    #[test]
+    fn sync_memory_connector_imports_jsonl_observations() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-sync")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = chrono::Utc::now();
+        db.insert_session(&session::Session {
+            id: "session-1".to_string(),
+            task: "recovery incident".to_string(),
+            project: "ecc-tools".to_string(),
+            task_group: "incident".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: session::SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: session::SessionMetrics::default(),
+        })?;
+
+        let connector_path = tempdir.path().join("hermes-memory.jsonl");
+        std::fs::write(
+            &connector_path,
+            [
+                serde_json::json!({
+                    "entity_name": "Auth callback recovery",
+                    "summary": "Customer wiped setup and got charged twice",
+                    "details": {"customer": "viktor"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "session_id": "latest",
+                    "entity_type": "file",
+                    "entity_name": "callback.ts",
+                    "path": "src/routes/auth/callback.ts",
+                    "observation_type": "incident_note",
+                    "summary": "Recovery flow needs portal-first routing"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "hermes_notes".to_string(),
+            config::MemoryConnectorConfig::JsonlFile(config::MemoryConnectorJsonlFileConfig {
+                path: connector_path,
+                session_id: Some("latest".to_string()),
+                default_entity_type: Some("incident".to_string()),
+                default_observation_type: Some("external_note".to_string()),
+            }),
+        );
+
+        let stats = sync_memory_connector(&db, &cfg, "hermes_notes", 10)?;
+        assert_eq!(stats.records_read, 2);
+        assert_eq!(stats.entities_upserted, 2);
+        assert_eq!(stats.observations_added, 2);
+        assert_eq!(stats.skipped_records, 0);
+
+        let recalled = db.recall_context_entities(None, "charged twice routing", 5)?;
+        assert_eq!(recalled.len(), 2);
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Auth callback recovery"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "callback.ts"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn format_graph_sync_stats_human_renders_counts() {
+        let text = format_graph_sync_stats_human(
+            &session::ContextGraphSyncStats {
+                sessions_scanned: 2,
+                decisions_processed: 3,
+                file_events_processed: 5,
+                messages_processed: 4,
+            },
+            Some("sess-12345678"),
+        );
+
+        assert!(text.contains("Context graph sync complete for sess-123"));
+        assert!(text.contains("- sessions scanned 2"));
+        assert!(text.contains("- decisions processed 3"));
+        assert!(text.contains("- file events processed 5"));
+        assert!(text.contains("- messages processed 4"));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -13,13 +13,18 @@ use crate::observability::{ToolCallEvent, ToolLogEntry, ToolLogPage};
 
 use super::output::{OutputLine, OutputStream, OUTPUT_BUFFER_LIMIT};
 use super::{
-    FileActivityAction, FileActivityEntry, Session, SessionMessage, SessionMetrics, SessionState,
-    WorktreeInfo,
+    default_project_label, default_task_group_label, normalize_group_label,
+    ContextGraphCompactionStats, ContextGraphEntity, ContextGraphEntityDetail,
+    ContextGraphObservation, ContextGraphRecallEntry, ContextGraphRelation, ContextGraphSyncStats,
+    DecisionLogEntry, FileActivityAction, FileActivityEntry, Session, SessionAgentProfile,
+    SessionMessage, SessionMetrics, SessionState, WorktreeInfo,
 };
 
 pub struct StateStore {
     conn: Connection,
 }
+
+const DEFAULT_CONTEXT_GRAPH_OBSERVATION_RETENTION: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct PendingWorktreeRequest {
@@ -36,6 +41,24 @@ pub struct FileActivityOverlap {
     pub other_session_id: String,
     pub other_session_state: SessionState,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConflictIncident {
+    pub id: i64,
+    pub conflict_key: String,
+    pub path: String,
+    pub first_session_id: String,
+    pub second_session_id: String,
+    pub active_session_id: String,
+    pub paused_session_id: String,
+    pub first_action: FileActivityAction,
+    pub second_action: FileActivityAction,
+    pub strategy: String,
+    pub summary: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -138,6 +161,8 @@ impl StateStore {
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 task TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                task_group TEXT NOT NULL DEFAULT '',
                 agent_type TEXT NOT NULL,
                 working_dir TEXT NOT NULL DEFAULT '.',
                 state TEXT NOT NULL DEFAULT 'pending',
@@ -173,6 +198,19 @@ impl StateStore {
                 file_events_json TEXT NOT NULL DEFAULT '[]'
             );
 
+            CREATE TABLE IF NOT EXISTS session_profiles (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                profile_name TEXT NOT NULL,
+                model TEXT,
+                allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+                disallowed_tools_json TEXT NOT NULL DEFAULT '[]',
+                permission_mode TEXT,
+                add_dirs_json TEXT NOT NULL DEFAULT '[]',
+                max_budget_usd REAL,
+                token_budget INTEGER,
+                append_system_prompt TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_session TEXT NOT NULL,
@@ -191,10 +229,70 @@ impl StateStore {
                 timestamp TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS decision_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                decision TEXT NOT NULL,
+                alternatives_json TEXT NOT NULL DEFAULT '[]',
+                reasoning TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS context_graph_entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                entity_key TEXT NOT NULL UNIQUE,
+                entity_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT,
+                summary TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS context_graph_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                from_entity_id INTEGER NOT NULL REFERENCES context_graph_entities(id) ON DELETE CASCADE,
+                to_entity_id INTEGER NOT NULL REFERENCES context_graph_entities(id) ON DELETE CASCADE,
+                relation_type TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(from_entity_id, to_entity_id, relation_type)
+            );
+
+            CREATE TABLE IF NOT EXISTS context_graph_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                entity_id INTEGER NOT NULL REFERENCES context_graph_entities(id) ON DELETE CASCADE,
+                observation_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS pending_worktree_queue (
                 session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                 repo_root TEXT NOT NULL,
                 requested_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS conflict_incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conflict_key TEXT NOT NULL UNIQUE,
+                path TEXT NOT NULL,
+                first_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                second_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                active_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                paused_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                first_action TEXT NOT NULL,
+                second_action TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS daemon_activity (
@@ -223,12 +321,21 @@ impl StateStore {
 
             CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
             CREATE INDEX IF NOT EXISTS idx_tool_log_session ON tool_log(session_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_log_hook_event
-                ON tool_log(hook_event_id)
-                WHERE hook_event_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_session, read);
             CREATE INDEX IF NOT EXISTS idx_session_output_session
                 ON session_output(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_decision_log_session
+                ON decision_log(session_id, timestamp, id);
+            CREATE INDEX IF NOT EXISTS idx_context_graph_entities_session
+                ON context_graph_entities(session_id, entity_type, updated_at, id);
+            CREATE INDEX IF NOT EXISTS idx_context_graph_relations_from
+                ON context_graph_relations(from_entity_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_context_graph_relations_to
+                ON context_graph_relations(to_entity_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_context_graph_observations_entity
+                ON context_graph_observations(entity_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_conflict_incidents_sessions
+                ON conflict_incidents(first_session_id, second_session_id, resolved_at, updated_at);
             CREATE INDEX IF NOT EXISTS idx_pending_worktree_queue_requested_at
                 ON pending_worktree_queue(requested_at, session_id);
 
@@ -253,6 +360,24 @@ impl StateStore {
             self.conn
                 .execute("ALTER TABLE sessions ADD COLUMN pid INTEGER", [])
                 .context("Failed to add pid column to sessions table")?;
+        }
+
+        if !self.has_column("sessions", "project")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .context("Failed to add project column to sessions table")?;
+        }
+
+        if !self.has_column("sessions", "task_group")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN task_group TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .context("Failed to add task_group column to sessions table")?;
         }
 
         if !self.has_column("sessions", "input_tokens")? {
@@ -478,11 +603,13 @@ impl StateStore {
 
     pub fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sessions (id, task, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base, created_at, updated_at, last_heartbeat_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO sessions (id, task, project, task_group, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base, created_at, updated_at, last_heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 session.id,
                 session.task,
+                session.project,
+                session.task_group,
                 session.agent_type,
                 session.working_dir.to_string_lossy().to_string(),
                 session.state.to_string(),
@@ -499,6 +626,98 @@ impl StateStore {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn upsert_session_profile(
+        &self,
+        session_id: &str,
+        profile: &SessionAgentProfile,
+    ) -> Result<()> {
+        let allowed_tools_json = serde_json::to_string(&profile.allowed_tools)
+            .context("serialize allowed agent profile tools")?;
+        let disallowed_tools_json = serde_json::to_string(&profile.disallowed_tools)
+            .context("serialize disallowed agent profile tools")?;
+        let add_dirs_json =
+            serde_json::to_string(&profile.add_dirs).context("serialize agent profile add_dirs")?;
+
+        self.conn.execute(
+            "INSERT INTO session_profiles (
+                session_id,
+                profile_name,
+                model,
+                allowed_tools_json,
+                disallowed_tools_json,
+                permission_mode,
+                add_dirs_json,
+                max_budget_usd,
+                token_budget,
+                append_system_prompt
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(session_id) DO UPDATE SET
+                profile_name = excluded.profile_name,
+                model = excluded.model,
+                allowed_tools_json = excluded.allowed_tools_json,
+                disallowed_tools_json = excluded.disallowed_tools_json,
+                permission_mode = excluded.permission_mode,
+                add_dirs_json = excluded.add_dirs_json,
+                max_budget_usd = excluded.max_budget_usd,
+                token_budget = excluded.token_budget,
+                append_system_prompt = excluded.append_system_prompt",
+            rusqlite::params![
+                session_id,
+                profile.profile_name,
+                profile.model,
+                allowed_tools_json,
+                disallowed_tools_json,
+                profile.permission_mode,
+                add_dirs_json,
+                profile.max_budget_usd,
+                profile.token_budget,
+                profile.append_system_prompt,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session_profile(&self, session_id: &str) -> Result<Option<SessionAgentProfile>> {
+        self.conn
+            .query_row(
+                "SELECT
+                    profile_name,
+                    model,
+                    allowed_tools_json,
+                    disallowed_tools_json,
+                    permission_mode,
+                    add_dirs_json,
+                    max_budget_usd,
+                    token_budget,
+                    append_system_prompt
+                 FROM session_profiles
+                 WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    let allowed_tools_json: String = row.get(2)?;
+                    let disallowed_tools_json: String = row.get(3)?;
+                    let add_dirs_json: String = row.get(5)?;
+                    Ok(SessionAgentProfile {
+                        profile_name: row.get(0)?,
+                        model: row.get(1)?,
+                        allowed_tools: serde_json::from_str(&allowed_tools_json)
+                            .unwrap_or_default(),
+                        disallowed_tools: serde_json::from_str(&disallowed_tools_json)
+                            .unwrap_or_default(),
+                        permission_mode: row.get(4)?,
+                        add_dirs: serde_json::from_str(&add_dirs_json).unwrap_or_default(),
+                        max_budget_usd: row.get(6)?,
+                        token_budget: row.get(7)?,
+                        append_system_prompt: row.get(8)?,
+                        agent: None,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn update_state_and_pid(
@@ -1033,6 +1252,9 @@ impl StateStore {
             for file_path in file_paths {
                 aggregate.file_paths.insert(file_path);
             }
+            for event in &file_events {
+                self.sync_context_graph_file_event(&row.session_id, &row.tool_name, event)?;
+            }
         }
 
         for session in self.list_sessions()? {
@@ -1044,6 +1266,167 @@ impl StateStore {
                 .unwrap_or(0);
             self.update_metrics(&session.id, &metrics)?;
         }
+
+        Ok(())
+    }
+
+    fn sync_context_graph_decision(
+        &self,
+        session_id: &str,
+        decision: &str,
+        alternatives: &[String],
+        reasoning: &str,
+    ) -> Result<()> {
+        let session_entity = self.sync_context_graph_session(session_id)?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "alternatives_count".to_string(),
+            alternatives.len().to_string(),
+        );
+        if !alternatives.is_empty() {
+            metadata.insert("alternatives".to_string(), alternatives.join(" | "));
+        }
+        let decision_entity = self.upsert_context_entity(
+            Some(session_id),
+            "decision",
+            decision,
+            None,
+            reasoning,
+            &metadata,
+        )?;
+        let relation_summary = format!("{} recorded this decision", session_entity.name);
+        self.upsert_context_relation(
+            Some(session_id),
+            session_entity.id,
+            decision_entity.id,
+            "decided",
+            &relation_summary,
+        )?;
+        Ok(())
+    }
+
+    fn sync_context_graph_file_event(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        event: &PersistedFileEvent,
+    ) -> Result<()> {
+        let session_entity = self.sync_context_graph_session(session_id)?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "last_action".to_string(),
+            file_activity_action_value(&event.action).to_string(),
+        );
+        metadata.insert("last_tool".to_string(), tool_name.trim().to_string());
+        if let Some(diff_preview) = &event.diff_preview {
+            metadata.insert("diff_preview".to_string(), diff_preview.clone());
+        }
+
+        let action = file_activity_action_value(&event.action);
+        let tool_name = tool_name.trim();
+        let summary = if let Some(diff_preview) = &event.diff_preview {
+            format!("Last activity: {action} via {tool_name} | {diff_preview}")
+        } else {
+            format!("Last activity: {action} via {tool_name}")
+        };
+        let name = context_graph_file_name(&event.path);
+        let file_entity = self.upsert_context_entity(
+            Some(session_id),
+            "file",
+            &name,
+            Some(&event.path),
+            &summary,
+            &metadata,
+        )?;
+        self.upsert_context_relation(
+            Some(session_id),
+            session_entity.id,
+            file_entity.id,
+            action,
+            &summary,
+        )?;
+        Ok(())
+    }
+
+    fn sync_context_graph_session(&self, session_id: &str) -> Result<ContextGraphEntity> {
+        let session = self.get_session(session_id)?;
+        let mut metadata = BTreeMap::new();
+        let persisted_session_id = if session.is_some() {
+            Some(session_id)
+        } else {
+            None
+        };
+        let summary = if let Some(session) = session {
+            metadata.insert("task".to_string(), session.task.clone());
+            metadata.insert("project".to_string(), session.project.clone());
+            metadata.insert("task_group".to_string(), session.task_group.clone());
+            metadata.insert("agent_type".to_string(), session.agent_type.clone());
+            metadata.insert("state".to_string(), session.state.to_string());
+            metadata.insert(
+                "working_dir".to_string(),
+                session.working_dir.display().to_string(),
+            );
+            if let Some(pid) = session.pid {
+                metadata.insert("pid".to_string(), pid.to_string());
+            }
+            if let Some(worktree) = &session.worktree {
+                metadata.insert(
+                    "worktree_path".to_string(),
+                    worktree.path.display().to_string(),
+                );
+                metadata.insert("worktree_branch".to_string(), worktree.branch.clone());
+                metadata.insert("base_branch".to_string(), worktree.base_branch.clone());
+            }
+
+            format!(
+                "{} | {} | {} / {}",
+                session.state, session.agent_type, session.project, session.task_group
+            )
+        } else {
+            metadata.insert("state".to_string(), "unknown".to_string());
+            "session placeholder".to_string()
+        };
+        self.upsert_context_entity(
+            persisted_session_id,
+            "session",
+            session_id,
+            None,
+            &summary,
+            &metadata,
+        )
+    }
+
+    fn sync_context_graph_message(
+        &self,
+        from_session_id: &str,
+        to_session_id: &str,
+        content: &str,
+        msg_type: &str,
+    ) -> Result<()> {
+        let relation_session_id = self
+            .get_session(from_session_id)?
+            .map(|session| session.id)
+            .filter(|id| !id.is_empty());
+        let from_entity = self.sync_context_graph_session(from_session_id)?;
+        let to_entity = self.sync_context_graph_session(to_session_id)?;
+
+        let relation_type = match msg_type {
+            "task_handoff" => "delegates_to",
+            "query" => "queries",
+            "response" => "responds_to",
+            "completed" => "completed_for",
+            "conflict" => "conflicts_with",
+            other => other,
+        };
+        let summary = crate::comms::preview(msg_type, content);
+
+        self.upsert_context_relation(
+            relation_session_id.as_deref(),
+            from_entity.id,
+            to_entity.id,
+            relation_type,
+            &summary,
+        )?;
 
         Ok(())
     }
@@ -1062,7 +1445,7 @@ impl StateStore {
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, task, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base,
+            "SELECT id, task, project, task_group, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base,
                     input_tokens, output_tokens, tokens_used, tool_calls, files_changed, duration_secs, cost_usd,
                     created_at, updated_at, last_heartbeat_at
              FROM sessions ORDER BY updated_at DESC",
@@ -1070,27 +1453,42 @@ impl StateStore {
 
         let sessions = stmt
             .query_map([], |row| {
-                let state_str: String = row.get(4)?;
+                let state_str: String = row.get(6)?;
                 let state = SessionState::from_db_value(&state_str);
 
-                let worktree_path: Option<String> = row.get(6)?;
+                let working_dir = PathBuf::from(row.get::<_, String>(5)?);
+                let project = row
+                    .get::<_, String>(2)
+                    .ok()
+                    .and_then(|value| normalize_group_label(&value))
+                    .unwrap_or_else(|| default_project_label(&working_dir));
+                let task: String = row.get(1)?;
+                let task_group = row
+                    .get::<_, String>(3)
+                    .ok()
+                    .and_then(|value| normalize_group_label(&value))
+                    .unwrap_or_else(|| default_task_group_label(&task));
+
+                let worktree_path: Option<String> = row.get(8)?;
                 let worktree = worktree_path.map(|path| super::WorktreeInfo {
                     path: PathBuf::from(path),
-                    branch: row.get::<_, String>(7).unwrap_or_default(),
-                    base_branch: row.get::<_, String>(8).unwrap_or_default(),
+                    branch: row.get::<_, String>(9).unwrap_or_default(),
+                    base_branch: row.get::<_, String>(10).unwrap_or_default(),
                 });
 
-                let created_str: String = row.get(16)?;
-                let updated_str: String = row.get(17)?;
-                let heartbeat_str: String = row.get(18)?;
+                let created_str: String = row.get(18)?;
+                let updated_str: String = row.get(19)?;
+                let heartbeat_str: String = row.get(20)?;
 
                 Ok(Session {
                     id: row.get(0)?,
-                    task: row.get(1)?,
-                    agent_type: row.get(2)?,
-                    working_dir: PathBuf::from(row.get::<_, String>(3)?),
+                    task,
+                    project,
+                    task_group,
+                    agent_type: row.get(4)?,
+                    working_dir,
                     state,
-                    pid: row.get::<_, Option<u32>>(5)?,
+                    pid: row.get::<_, Option<u32>>(7)?,
                     worktree,
                     created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                         .unwrap_or_default()
@@ -1104,13 +1502,13 @@ impl StateStore {
                         })
                         .with_timezone(&chrono::Utc),
                     metrics: SessionMetrics {
-                        input_tokens: row.get(9)?,
-                        output_tokens: row.get(10)?,
-                        tokens_used: row.get(11)?,
-                        tool_calls: row.get(12)?,
-                        files_changed: row.get(13)?,
-                        duration_secs: row.get(14)?,
-                        cost_usd: row.get(15)?,
+                        input_tokens: row.get(11)?,
+                        output_tokens: row.get(12)?,
+                        tokens_used: row.get(13)?,
+                        tool_calls: row.get(14)?,
+                        files_changed: row.get(15)?,
+                        duration_secs: row.get(16)?,
+                        cost_usd: row.get(17)?,
                     },
                 })
             })?
@@ -1162,7 +1560,43 @@ impl StateStore {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![from, to, content, msg_type, chrono::Utc::now().to_rfc3339()],
         )?;
+        self.sync_context_graph_message(from, to, content, msg_type)?;
         Ok(())
+    }
+
+    fn list_messages_sent_by_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_session, to_session, content, msg_type, read, timestamp
+             FROM messages
+             WHERE from_session = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+
+        let mut messages = stmt
+            .query_map(rusqlite::params![session_id, limit as i64], |row| {
+                let timestamp: String = row.get(6)?;
+
+                Ok(SessionMessage {
+                    id: row.get(0)?,
+                    from_session: row.get(1)?,
+                    to_session: row.get(2)?,
+                    content: row.get(3)?,
+                    msg_type: row.get(4)?,
+                    read: row.get::<_, i64>(5)? != 0,
+                    timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Utc),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        messages.reverse();
+        Ok(messages)
     }
 
     pub fn list_messages_for_session(
@@ -1262,6 +1696,35 @@ impl StateStore {
         messages.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn latest_unread_approval_message(&self) -> Result<Option<SessionMessage>> {
+        self.conn
+            .query_row(
+                "SELECT id, from_session, to_session, content, msg_type, read, timestamp
+                 FROM messages
+                 WHERE read = 0 AND msg_type IN ('query', 'conflict')
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    let timestamp: String = row.get(6)?;
+
+                    Ok(SessionMessage {
+                        id: row.get(0)?,
+                        from_session: row.get(1)?,
+                        to_session: row.get(2)?,
+                        content: row.get(3)?,
+                        msg_type: row.get(4)?,
+                        read: row.get::<_, i64>(5)? != 0,
+                        timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp)
+                            .unwrap_or_default()
+                            .with_timezone(&chrono::Utc),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn unread_task_handoffs_for_session(
         &self,
         session_id: &str,
@@ -1355,6 +1818,662 @@ impl StateStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn insert_decision(
+        &self,
+        session_id: &str,
+        decision: &str,
+        alternatives: &[String],
+        reasoning: &str,
+    ) -> Result<DecisionLogEntry> {
+        let timestamp = chrono::Utc::now();
+        let alternatives_json = serde_json::to_string(alternatives)
+            .context("Failed to serialize decision alternatives")?;
+
+        self.conn.execute(
+            "INSERT INTO decision_log (session_id, decision, alternatives_json, reasoning, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                session_id,
+                decision,
+                alternatives_json,
+                reasoning,
+                timestamp.to_rfc3339(),
+            ],
+        )?;
+
+        self.sync_context_graph_decision(session_id, decision, alternatives, reasoning)?;
+
+        Ok(DecisionLogEntry {
+            id: self.conn.last_insert_rowid(),
+            session_id: session_id.to_string(),
+            decision: decision.to_string(),
+            alternatives: alternatives.to_vec(),
+            reasoning: reasoning.to_string(),
+            timestamp,
+        })
+    }
+
+    pub fn list_decisions_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DecisionLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, decision, alternatives_json, reasoning, timestamp
+             FROM (
+                 SELECT id, session_id, decision, alternatives_json, reasoning, timestamp
+                 FROM decision_log
+                 WHERE session_id = ?1
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?2
+             )
+             ORDER BY timestamp ASC, id ASC",
+        )?;
+
+        let entries = stmt
+            .query_map(rusqlite::params![session_id, limit as i64], |row| {
+                map_decision_log_entry(row)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    pub fn list_decisions(&self, limit: usize) -> Result<Vec<DecisionLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, decision, alternatives_json, reasoning, timestamp
+             FROM (
+                 SELECT id, session_id, decision, alternatives_json, reasoning, timestamp
+                 FROM decision_log
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?1
+             )
+             ORDER BY timestamp ASC, id ASC",
+        )?;
+
+        let entries = stmt
+            .query_map(rusqlite::params![limit as i64], map_decision_log_entry)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    pub fn sync_context_graph_history(
+        &self,
+        session_id: Option<&str>,
+        per_session_limit: usize,
+    ) -> Result<ContextGraphSyncStats> {
+        let sessions = if let Some(session_id) = session_id {
+            let session = self
+                .get_session(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+            vec![session]
+        } else {
+            self.list_sessions()?
+        };
+
+        let mut stats = ContextGraphSyncStats::default();
+        for session in sessions {
+            stats.sessions_scanned = stats.sessions_scanned.saturating_add(1);
+
+            for entry in self.list_decisions_for_session(&session.id, per_session_limit)? {
+                self.sync_context_graph_decision(
+                    &session.id,
+                    &entry.decision,
+                    &entry.alternatives,
+                    &entry.reasoning,
+                )?;
+                stats.decisions_processed = stats.decisions_processed.saturating_add(1);
+            }
+
+            for entry in self.list_file_activity(&session.id, per_session_limit)? {
+                let persisted = PersistedFileEvent {
+                    path: entry.path.clone(),
+                    action: entry.action.clone(),
+                    diff_preview: entry.diff_preview.clone(),
+                    patch_preview: entry.patch_preview.clone(),
+                };
+                self.sync_context_graph_file_event(&session.id, "history", &persisted)?;
+                stats.file_events_processed = stats.file_events_processed.saturating_add(1);
+            }
+
+            for message in self.list_messages_sent_by_session(&session.id, per_session_limit)? {
+                self.sync_context_graph_message(
+                    &message.from_session,
+                    &message.to_session,
+                    &message.content,
+                    &message.msg_type,
+                )?;
+                stats.messages_processed = stats.messages_processed.saturating_add(1);
+            }
+        }
+
+        Ok(stats)
+    }
+
+    pub fn upsert_context_entity(
+        &self,
+        session_id: Option<&str>,
+        entity_type: &str,
+        name: &str,
+        path: Option<&str>,
+        summary: &str,
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<ContextGraphEntity> {
+        let entity_type = entity_type.trim();
+        if entity_type.is_empty() {
+            return Err(anyhow::anyhow!("Context graph entity type cannot be empty"));
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Context graph entity name cannot be empty"));
+        }
+
+        let normalized_path = path.map(str::trim).filter(|value| !value.is_empty());
+        let summary = summary.trim();
+        let entity_key = context_graph_entity_key(entity_type, name, normalized_path);
+        let metadata_json = serde_json::to_string(metadata)
+            .context("Failed to serialize context graph metadata")?;
+        let timestamp = chrono::Utc::now().to_rfc3339();
+
+        self.conn.execute(
+            "INSERT INTO context_graph_entities (
+                session_id, entity_key, entity_type, name, path, summary, metadata_json, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(entity_key) DO UPDATE SET
+                session_id = COALESCE(excluded.session_id, context_graph_entities.session_id),
+                summary = CASE
+                    WHEN excluded.summary <> '' THEN excluded.summary
+                    ELSE context_graph_entities.summary
+                END,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                session_id,
+                entity_key,
+                entity_type,
+                name,
+                normalized_path,
+                summary,
+                metadata_json,
+                timestamp,
+            ],
+        )?;
+
+        self.conn
+            .query_row(
+                "SELECT id, session_id, entity_type, name, path, summary, metadata_json, created_at, updated_at
+                 FROM context_graph_entities
+                 WHERE entity_key = ?1",
+                rusqlite::params![entity_key],
+                map_context_graph_entity,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn list_context_entities(
+        &self,
+        session_id: Option<&str>,
+        entity_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ContextGraphEntity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, entity_type, name, path, summary, metadata_json, created_at, updated_at
+             FROM context_graph_entities
+             WHERE (?1 IS NULL OR session_id = ?1)
+               AND (?2 IS NULL OR entity_type = ?2)
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?3",
+        )?;
+
+        let entries = stmt
+            .query_map(
+                rusqlite::params![session_id, entity_type, limit as i64],
+                map_context_graph_entity,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    pub fn recall_context_entities(
+        &self,
+        session_id: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ContextGraphRecallEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let terms = context_graph_recall_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let candidate_limit = (limit.saturating_mul(12)).clamp(24, 512);
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.session_id, e.entity_type, e.name, e.path, e.summary, e.metadata_json,
+                    e.created_at, e.updated_at,
+                    (
+                        SELECT COUNT(*)
+                        FROM context_graph_relations r
+                        WHERE r.from_entity_id = e.id OR r.to_entity_id = e.id
+                    ) AS relation_count,
+                    COALESCE((
+                        SELECT group_concat(summary, ' ')
+                        FROM (
+                            SELECT summary
+                            FROM context_graph_observations o
+                            WHERE o.entity_id = e.id
+                            ORDER BY o.created_at DESC, o.id DESC
+                            LIMIT 4
+                        )
+                    ), '') AS observation_text,
+                    (
+                        SELECT COUNT(*)
+                        FROM context_graph_observations o
+                        WHERE o.entity_id = e.id
+                    ) AS observation_count
+             FROM context_graph_entities e
+             WHERE (?1 IS NULL OR e.session_id = ?1)
+             ORDER BY e.updated_at DESC, e.id DESC
+             LIMIT ?2",
+        )?;
+
+        let candidates = stmt
+            .query_map(
+                rusqlite::params![session_id, candidate_limit as i64],
+                |row| {
+                    let entity = map_context_graph_entity(row)?;
+                    let relation_count = row.get::<_, i64>(9)?.max(0) as usize;
+                    let observation_text = row.get::<_, String>(10)?;
+                    let observation_count = row.get::<_, i64>(11)?.max(0) as usize;
+                    Ok((entity, relation_count, observation_text, observation_count))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let now = chrono::Utc::now();
+        let mut entries = candidates
+            .into_iter()
+            .filter_map(
+                |(entity, relation_count, observation_text, observation_count)| {
+                    let matched_terms =
+                        context_graph_matched_terms(&entity, &observation_text, &terms);
+                    if matched_terms.is_empty() {
+                        return None;
+                    }
+
+                    Some(ContextGraphRecallEntry {
+                        score: context_graph_recall_score(
+                            matched_terms.len(),
+                            relation_count,
+                            observation_count,
+                            entity.updated_at,
+                            now,
+                        ),
+                        entity,
+                        matched_terms,
+                        relation_count,
+                        observation_count,
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+
+        entries.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.entity.updated_at.cmp(&left.entity.updated_at))
+                .then_with(|| right.entity.id.cmp(&left.entity.id))
+        });
+        entries.truncate(limit);
+
+        Ok(entries)
+    }
+
+    pub fn get_context_entity_detail(
+        &self,
+        entity_id: i64,
+        relation_limit: usize,
+    ) -> Result<Option<ContextGraphEntityDetail>> {
+        let entity = self
+            .conn
+            .query_row(
+                "SELECT id, session_id, entity_type, name, path, summary, metadata_json, created_at, updated_at
+                 FROM context_graph_entities
+                 WHERE id = ?1",
+                rusqlite::params![entity_id],
+                map_context_graph_entity,
+            )
+            .optional()?;
+
+        let Some(entity) = entity else {
+            return Ok(None);
+        };
+
+        let mut outgoing_stmt = self.conn.prepare(
+            "SELECT r.id, r.session_id,
+                    r.from_entity_id, src.entity_type, src.name,
+                    r.to_entity_id, dst.entity_type, dst.name,
+                    r.relation_type, r.summary, r.created_at
+             FROM context_graph_relations r
+             JOIN context_graph_entities src ON src.id = r.from_entity_id
+             JOIN context_graph_entities dst ON dst.id = r.to_entity_id
+             WHERE r.from_entity_id = ?1
+             ORDER BY r.created_at DESC, r.id DESC
+             LIMIT ?2",
+        )?;
+        let outgoing = outgoing_stmt
+            .query_map(
+                rusqlite::params![entity_id, relation_limit as i64],
+                map_context_graph_relation,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut incoming_stmt = self.conn.prepare(
+            "SELECT r.id, r.session_id,
+                    r.from_entity_id, src.entity_type, src.name,
+                    r.to_entity_id, dst.entity_type, dst.name,
+                    r.relation_type, r.summary, r.created_at
+             FROM context_graph_relations r
+             JOIN context_graph_entities src ON src.id = r.from_entity_id
+             JOIN context_graph_entities dst ON dst.id = r.to_entity_id
+             WHERE r.to_entity_id = ?1
+             ORDER BY r.created_at DESC, r.id DESC
+             LIMIT ?2",
+        )?;
+        let incoming = incoming_stmt
+            .query_map(
+                rusqlite::params![entity_id, relation_limit as i64],
+                map_context_graph_relation,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(ContextGraphEntityDetail {
+            entity,
+            outgoing,
+            incoming,
+        }))
+    }
+
+    pub fn add_context_observation(
+        &self,
+        session_id: Option<&str>,
+        entity_id: i64,
+        observation_type: &str,
+        summary: &str,
+        details: &BTreeMap<String, String>,
+    ) -> Result<ContextGraphObservation> {
+        if observation_type.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Context graph observation type cannot be empty"
+            ));
+        }
+        if summary.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Context graph observation summary cannot be empty"
+            ));
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let details_json = serde_json::to_string(details)?;
+        self.conn.execute(
+            "INSERT INTO context_graph_observations (
+                session_id, entity_id, observation_type, summary, details_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                session_id,
+                entity_id,
+                observation_type.trim(),
+                summary.trim(),
+                details_json,
+                now,
+            ],
+        )?;
+        let observation_id = self.conn.last_insert_rowid();
+        self.compact_context_graph_observations(
+            None,
+            Some(entity_id),
+            DEFAULT_CONTEXT_GRAPH_OBSERVATION_RETENTION,
+        )?;
+        self.conn
+            .query_row(
+                "SELECT o.id, o.session_id, o.entity_id, e.entity_type, e.name,
+                        o.observation_type, o.summary, o.details_json, o.created_at
+                 FROM context_graph_observations o
+                 JOIN context_graph_entities e ON e.id = o.entity_id
+                 WHERE o.id = ?1",
+                rusqlite::params![observation_id],
+                map_context_graph_observation,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn compact_context_graph(
+        &self,
+        session_id: Option<&str>,
+        keep_observations_per_entity: usize,
+    ) -> Result<ContextGraphCompactionStats> {
+        self.compact_context_graph_observations(session_id, None, keep_observations_per_entity)
+    }
+
+    pub fn add_session_observation(
+        &self,
+        session_id: &str,
+        observation_type: &str,
+        summary: &str,
+        details: &BTreeMap<String, String>,
+    ) -> Result<ContextGraphObservation> {
+        let session_entity = self.sync_context_graph_session(session_id)?;
+        self.add_context_observation(
+            Some(session_id),
+            session_entity.id,
+            observation_type,
+            summary,
+            details,
+        )
+    }
+
+    pub fn list_context_observations(
+        &self,
+        entity_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ContextGraphObservation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.id, o.session_id, o.entity_id, e.entity_type, e.name,
+                    o.observation_type, o.summary, o.details_json, o.created_at
+             FROM context_graph_observations o
+             JOIN context_graph_entities e ON e.id = o.entity_id
+             WHERE (?1 IS NULL OR o.entity_id = ?1)
+             ORDER BY o.created_at DESC, o.id DESC
+             LIMIT ?2",
+        )?;
+
+        let entries = stmt
+            .query_map(
+                rusqlite::params![entity_id, limit as i64],
+                map_context_graph_observation,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
+
+    fn compact_context_graph_observations(
+        &self,
+        session_id: Option<&str>,
+        entity_id: Option<i64>,
+        keep_observations_per_entity: usize,
+    ) -> Result<ContextGraphCompactionStats> {
+        let entities_scanned = self.conn.query_row(
+            "SELECT COUNT(DISTINCT o.entity_id)
+             FROM context_graph_observations o
+             JOIN context_graph_entities e ON e.id = o.entity_id
+             WHERE (?1 IS NULL OR e.session_id = ?1)
+               AND (?2 IS NULL OR o.entity_id = ?2)",
+            rusqlite::params![session_id, entity_id],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+
+        let duplicate_observations_deleted = self.conn.execute(
+            "DELETE FROM context_graph_observations
+             WHERE id IN (
+                 SELECT id
+                 FROM (
+                     SELECT o.id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY o.entity_id, o.observation_type, o.summary
+                                ORDER BY o.created_at DESC, o.id DESC
+                            ) AS rn
+                     FROM context_graph_observations o
+                     JOIN context_graph_entities e ON e.id = o.entity_id
+                     WHERE (?1 IS NULL OR e.session_id = ?1)
+                       AND (?2 IS NULL OR o.entity_id = ?2)
+                 ) ranked
+                 WHERE ranked.rn > 1
+             )",
+            rusqlite::params![session_id, entity_id],
+        )?;
+
+        let overflow_observations_deleted = if keep_observations_per_entity == 0 {
+            self.conn.execute(
+                "DELETE FROM context_graph_observations
+                 WHERE id IN (
+                     SELECT o.id
+                     FROM context_graph_observations o
+                     JOIN context_graph_entities e ON e.id = o.entity_id
+                     WHERE (?1 IS NULL OR e.session_id = ?1)
+                       AND (?2 IS NULL OR o.entity_id = ?2)
+                 )",
+                rusqlite::params![session_id, entity_id],
+            )?
+        } else {
+            self.conn.execute(
+                "DELETE FROM context_graph_observations
+                 WHERE id IN (
+                     SELECT id
+                     FROM (
+                         SELECT o.id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY o.entity_id
+                                    ORDER BY o.created_at DESC, o.id DESC
+                                ) AS rn
+                         FROM context_graph_observations o
+                         JOIN context_graph_entities e ON e.id = o.entity_id
+                         WHERE (?1 IS NULL OR e.session_id = ?1)
+                           AND (?2 IS NULL OR o.entity_id = ?2)
+                     ) ranked
+                     WHERE ranked.rn > ?3
+                 )",
+                rusqlite::params![session_id, entity_id, keep_observations_per_entity as i64],
+            )?
+        };
+
+        let observations_retained = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM context_graph_observations o
+             JOIN context_graph_entities e ON e.id = o.entity_id
+             WHERE (?1 IS NULL OR e.session_id = ?1)
+               AND (?2 IS NULL OR o.entity_id = ?2)",
+            rusqlite::params![session_id, entity_id],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+
+        Ok(ContextGraphCompactionStats {
+            entities_scanned,
+            duplicate_observations_deleted,
+            overflow_observations_deleted,
+            observations_retained,
+        })
+    }
+
+    pub fn upsert_context_relation(
+        &self,
+        session_id: Option<&str>,
+        from_entity_id: i64,
+        to_entity_id: i64,
+        relation_type: &str,
+        summary: &str,
+    ) -> Result<ContextGraphRelation> {
+        let relation_type = relation_type.trim();
+        if relation_type.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Context graph relation type cannot be empty"
+            ));
+        }
+        let summary = summary.trim();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+
+        self.conn.execute(
+            "INSERT INTO context_graph_relations (
+                session_id, from_entity_id, to_entity_id, relation_type, summary, created_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(from_entity_id, to_entity_id, relation_type) DO UPDATE SET
+                session_id = COALESCE(excluded.session_id, context_graph_relations.session_id),
+                summary = CASE
+                    WHEN excluded.summary <> '' THEN excluded.summary
+                    ELSE context_graph_relations.summary
+                END",
+            rusqlite::params![
+                session_id,
+                from_entity_id,
+                to_entity_id,
+                relation_type,
+                summary,
+                timestamp,
+            ],
+        )?;
+
+        self.conn
+            .query_row(
+                "SELECT r.id, r.session_id,
+                        r.from_entity_id, src.entity_type, src.name,
+                        r.to_entity_id, dst.entity_type, dst.name,
+                        r.relation_type, r.summary, r.created_at
+                 FROM context_graph_relations r
+                 JOIN context_graph_entities src ON src.id = r.from_entity_id
+                 JOIN context_graph_entities dst ON dst.id = r.to_entity_id
+                 WHERE r.from_entity_id = ?1
+                   AND r.to_entity_id = ?2
+                   AND r.relation_type = ?3",
+                rusqlite::params![from_entity_id, to_entity_id, relation_type],
+                map_context_graph_relation,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn list_context_relations(
+        &self,
+        entity_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ContextGraphRelation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.session_id,
+                    r.from_entity_id, src.entity_type, src.name,
+                    r.to_entity_id, dst.entity_type, dst.name,
+                    r.relation_type, r.summary, r.created_at
+             FROM context_graph_relations r
+             JOIN context_graph_entities src ON src.id = r.from_entity_id
+             JOIN context_graph_entities dst ON dst.id = r.to_entity_id
+             WHERE (?1 IS NULL OR r.from_entity_id = ?1 OR r.to_entity_id = ?1)
+             ORDER BY r.created_at DESC, r.id DESC
+             LIMIT ?2",
+        )?;
+
+        let relations = stmt
+            .query_map(
+                rusqlite::params![entity_id, limit as i64],
+                map_context_graph_relation,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(relations)
     }
 
     pub fn daemon_activity(&self) -> Result<DaemonActivity> {
@@ -1885,6 +3004,157 @@ impl StateStore {
         overlaps.truncate(limit);
         Ok(overlaps)
     }
+
+    pub fn has_open_conflict_incident(&self, conflict_key: &str) -> Result<bool> {
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1
+                 FROM conflict_incidents
+                 WHERE conflict_key = ?1 AND resolved_at IS NULL
+                 LIMIT 1",
+                rusqlite::params![conflict_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_conflict_incident(
+        &self,
+        conflict_key: &str,
+        path: &str,
+        first_session_id: &str,
+        second_session_id: &str,
+        active_session_id: &str,
+        paused_session_id: &str,
+        first_action: &FileActivityAction,
+        second_action: &FileActivityAction,
+        strategy: &str,
+        summary: &str,
+    ) -> Result<ConflictIncident> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO conflict_incidents (
+                 conflict_key, path, first_session_id, second_session_id,
+                 active_session_id, paused_session_id, first_action, second_action,
+                 strategy, summary, created_at, updated_at, resolved_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, NULL)
+             ON CONFLICT(conflict_key) DO UPDATE SET
+                 path = excluded.path,
+                 first_session_id = excluded.first_session_id,
+                 second_session_id = excluded.second_session_id,
+                 active_session_id = excluded.active_session_id,
+                 paused_session_id = excluded.paused_session_id,
+                 first_action = excluded.first_action,
+                 second_action = excluded.second_action,
+                 strategy = excluded.strategy,
+                 summary = excluded.summary,
+                 updated_at = excluded.updated_at,
+                 resolved_at = NULL",
+            rusqlite::params![
+                conflict_key,
+                path,
+                first_session_id,
+                second_session_id,
+                active_session_id,
+                paused_session_id,
+                file_activity_action_value(first_action),
+                file_activity_action_value(second_action),
+                strategy,
+                summary,
+                now,
+            ],
+        )?;
+
+        self.conn
+            .query_row(
+                "SELECT id, conflict_key, path, first_session_id, second_session_id,
+                        active_session_id, paused_session_id, first_action, second_action,
+                        strategy, summary, created_at, updated_at, resolved_at
+                 FROM conflict_incidents
+                 WHERE conflict_key = ?1",
+                rusqlite::params![conflict_key],
+                map_conflict_incident,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn resolve_conflict_incidents_not_in(
+        &self,
+        active_keys: &HashSet<String>,
+    ) -> Result<usize> {
+        let open = self.list_open_conflict_incidents(512)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut resolved = 0;
+
+        for incident in open {
+            if active_keys.contains(&incident.conflict_key) {
+                continue;
+            }
+
+            resolved += self.conn.execute(
+                "UPDATE conflict_incidents
+                 SET resolved_at = ?2, updated_at = ?2
+                 WHERE conflict_key = ?1 AND resolved_at IS NULL",
+                rusqlite::params![incident.conflict_key, now],
+            )?;
+        }
+
+        Ok(resolved)
+    }
+
+    pub fn list_open_conflict_incidents_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ConflictIncident>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, conflict_key, path, first_session_id, second_session_id,
+                    active_session_id, paused_session_id, first_action, second_action,
+                    strategy, summary, created_at, updated_at, resolved_at
+             FROM conflict_incidents
+             WHERE resolved_at IS NULL
+               AND (
+                   first_session_id = ?1
+                   OR second_session_id = ?1
+                   OR active_session_id = ?1
+                   OR paused_session_id = ?1
+               )
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+
+        let incidents = stmt
+            .query_map(
+                rusqlite::params![session_id, limit as i64],
+                map_conflict_incident,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(incidents)
+    }
+
+    fn list_open_conflict_incidents(&self, limit: usize) -> Result<Vec<ConflictIncident>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, conflict_key, path, first_session_id, second_session_id,
+                    active_session_id, paused_session_id, first_action, second_action,
+                    strategy, summary, created_at, updated_at, resolved_at
+             FROM conflict_incidents
+             WHERE resolved_at IS NULL
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+
+        let incidents = stmt
+            .query_map(rusqlite::params![limit as i64], map_conflict_incident)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(incidents)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1918,6 +3188,70 @@ fn parse_persisted_file_events(value: &str) -> Option<Vec<PersistedFileEvent>> {
         return None;
     }
     Some(events)
+}
+
+fn file_activity_action_value(action: &FileActivityAction) -> &'static str {
+    match action {
+        FileActivityAction::Read => "read",
+        FileActivityAction::Create => "create",
+        FileActivityAction::Modify => "modify",
+        FileActivityAction::Move => "move",
+        FileActivityAction::Delete => "delete",
+        FileActivityAction::Touch => "touch",
+    }
+}
+
+fn map_conflict_incident(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConflictIncident> {
+    let created_at = parse_timestamp_column(row.get::<_, String>(11)?, 11)?;
+    let updated_at = parse_timestamp_column(row.get::<_, String>(12)?, 12)?;
+    let resolved_at = row
+        .get::<_, Option<String>>(13)?
+        .map(|value| parse_timestamp_column(value, 13))
+        .transpose()?;
+
+    Ok(ConflictIncident {
+        id: row.get(0)?,
+        conflict_key: row.get(1)?,
+        path: row.get(2)?,
+        first_session_id: row.get(3)?,
+        second_session_id: row.get(4)?,
+        active_session_id: row.get(5)?,
+        paused_session_id: row.get(6)?,
+        first_action: parse_file_activity_action(&row.get::<_, String>(7)?).ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(
+                7,
+                "first_action".into(),
+                rusqlite::types::Type::Text,
+            )
+        })?,
+        second_action: parse_file_activity_action(&row.get::<_, String>(8)?).ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(
+                8,
+                "second_action".into(),
+                rusqlite::types::Type::Text,
+            )
+        })?,
+        strategy: row.get(9)?,
+        summary: row.get(10)?,
+        created_at,
+        updated_at,
+        resolved_at,
+    })
+}
+
+fn parse_timestamp_column(
+    value: String,
+    index: usize,
+) -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(&value)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
 }
 
 fn parse_file_activity_action(value: &str) -> Option<FileActivityAction> {
@@ -1969,6 +3303,201 @@ fn session_state_supports_overlap(state: &SessionState) -> bool {
         state,
         SessionState::Pending | SessionState::Running | SessionState::Idle | SessionState::Stale
     )
+}
+
+fn map_decision_log_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionLogEntry> {
+    let alternatives_json = row
+        .get::<_, Option<String>>(3)?
+        .unwrap_or_else(|| "[]".to_string());
+    let alternatives = serde_json::from_str(&alternatives_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let timestamp = row.get::<_, String>(5)?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+
+    Ok(DecisionLogEntry {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        decision: row.get(2)?,
+        alternatives,
+        reasoning: row.get(4)?,
+        timestamp,
+    })
+}
+
+fn map_context_graph_entity(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextGraphEntity> {
+    let metadata_json = row
+        .get::<_, Option<String>>(6)?
+        .unwrap_or_else(|| "{}".to_string());
+    let metadata = serde_json::from_str(&metadata_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let created_at = parse_store_timestamp(row.get::<_, String>(7)?, 7)?;
+    let updated_at = parse_store_timestamp(row.get::<_, String>(8)?, 8)?;
+
+    Ok(ContextGraphEntity {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        entity_type: row.get(2)?,
+        name: row.get(3)?,
+        path: row.get(4)?,
+        summary: row.get(5)?,
+        metadata,
+        created_at,
+        updated_at,
+    })
+}
+
+fn map_context_graph_relation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextGraphRelation> {
+    let created_at = parse_store_timestamp(row.get::<_, String>(10)?, 10)?;
+
+    Ok(ContextGraphRelation {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        from_entity_id: row.get(2)?,
+        from_entity_type: row.get(3)?,
+        from_entity_name: row.get(4)?,
+        to_entity_id: row.get(5)?,
+        to_entity_type: row.get(6)?,
+        to_entity_name: row.get(7)?,
+        relation_type: row.get(8)?,
+        summary: row.get(9)?,
+        created_at,
+    })
+}
+
+fn map_context_graph_observation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContextGraphObservation> {
+    let details_json = row
+        .get::<_, Option<String>>(7)?
+        .unwrap_or_else(|| "{}".to_string());
+    let details = serde_json::from_str(&details_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let created_at = parse_store_timestamp(row.get::<_, String>(8)?, 8)?;
+
+    Ok(ContextGraphObservation {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        entity_id: row.get(2)?,
+        entity_type: row.get(3)?,
+        entity_name: row.get(4)?,
+        observation_type: row.get(5)?,
+        summary: row.get(6)?,
+        details,
+        created_at,
+    })
+}
+
+fn context_graph_recall_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw_term in
+        query.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
+    {
+        let term = raw_term.trim().to_ascii_lowercase();
+        if term.len() < 3 || terms.iter().any(|existing| existing == &term) {
+            continue;
+        }
+        terms.push(term);
+    }
+    terms
+}
+
+fn context_graph_matched_terms(
+    entity: &ContextGraphEntity,
+    observation_text: &str,
+    terms: &[String],
+) -> Vec<String> {
+    let mut haystacks = vec![
+        entity.entity_type.to_ascii_lowercase(),
+        entity.name.to_ascii_lowercase(),
+        entity.summary.to_ascii_lowercase(),
+    ];
+    if let Some(path) = entity.path.as_ref() {
+        haystacks.push(path.to_ascii_lowercase());
+    }
+    for (key, value) in &entity.metadata {
+        haystacks.push(key.to_ascii_lowercase());
+        haystacks.push(value.to_ascii_lowercase());
+    }
+    if !observation_text.trim().is_empty() {
+        haystacks.push(observation_text.to_ascii_lowercase());
+    }
+
+    let mut matched = Vec::new();
+    for term in terms {
+        if haystacks.iter().any(|value| value.contains(term)) {
+            matched.push(term.clone());
+        }
+    }
+    matched
+}
+
+fn context_graph_recall_score(
+    matched_term_count: usize,
+    relation_count: usize,
+    observation_count: usize,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    let recency_bonus = {
+        let age = now.signed_duration_since(updated_at);
+        if age <= chrono::Duration::hours(1) {
+            9
+        } else if age <= chrono::Duration::hours(24) {
+            6
+        } else if age <= chrono::Duration::days(7) {
+            3
+        } else {
+            0
+        }
+    };
+
+    (matched_term_count as u64 * 100)
+        + (relation_count.min(9) as u64 * 10)
+        + (observation_count.min(6) as u64 * 8)
+        + recency_bonus
+}
+
+fn parse_store_timestamp(
+    raw: String,
+    column: usize,
+) -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(&raw)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+}
+
+fn context_graph_entity_key(entity_type: &str, name: &str, path: Option<&str>) -> String {
+    format!(
+        "{}::{}::{}",
+        entity_type.trim().to_ascii_lowercase(),
+        name.trim().to_ascii_lowercase(),
+        path.unwrap_or("").trim()
+    )
+}
+
+fn context_graph_file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 fn file_overlap_is_relevant(current: &FileActivityEntry, other: &FileActivityEntry) -> bool {
@@ -2023,6 +3552,8 @@ mod tests {
         Session {
             id: id.to_string(),
             task: "task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state,
@@ -2098,6 +3629,66 @@ mod tests {
     }
 
     #[test]
+    fn session_profile_round_trips_with_launch_settings() -> Result<()> {
+        let tempdir = TestDir::new("store-session-profile")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "review work".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Pending,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.upsert_session_profile(
+            "session-1",
+            &crate::session::SessionAgentProfile {
+                agent: None,
+                profile_name: "reviewer".to_string(),
+                model: Some("sonnet".to_string()),
+                allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
+                disallowed_tools: vec!["Bash".to_string()],
+                permission_mode: Some("plan".to_string()),
+                add_dirs: vec![PathBuf::from("docs"), PathBuf::from("specs")],
+                max_budget_usd: Some(1.5),
+                token_budget: Some(1200),
+                append_system_prompt: Some("Review thoroughly.".to_string()),
+            },
+        )?;
+
+        let profile = db
+            .get_session_profile("session-1")?
+            .expect("profile should be stored");
+        assert_eq!(profile.profile_name, "reviewer");
+        assert_eq!(profile.model.as_deref(), Some("sonnet"));
+        assert_eq!(profile.allowed_tools, vec!["Read", "Edit"]);
+        assert_eq!(profile.disallowed_tools, vec!["Bash"]);
+        assert_eq!(profile.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(
+            profile.add_dirs,
+            vec![PathBuf::from("docs"), PathBuf::from("specs")]
+        );
+        assert_eq!(profile.max_budget_usd, Some(1.5));
+        assert_eq!(profile.token_budget, Some(1200));
+        assert_eq!(
+            profile.append_system_prompt.as_deref(),
+            Some("Review thoroughly.")
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn sync_cost_tracker_metrics_aggregates_usage_into_sessions() -> Result<()> {
         let tempdir = TestDir::new("store-cost-metrics")?;
         let db = StateStore::open(&tempdir.path().join("state.db"))?;
@@ -2106,6 +3697,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "sync usage".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2151,6 +3744,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "sync tools".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2164,6 +3759,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-2".to_string(),
             task: "no activity".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Pending,
@@ -2228,6 +3825,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "sync tools".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2273,6 +3872,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "sync tools".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2321,6 +3922,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "focus".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2334,6 +3937,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-2".to_string(),
             task: "delegate".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Idle,
@@ -2347,6 +3952,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-3".to_string(),
             task: "done".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Completed,
@@ -2384,6 +3991,831 @@ mod tests {
     }
 
     #[test]
+    fn conflict_incidents_upsert_and_resolve() -> Result<()> {
+        let tempdir = TestDir::new("store-conflict-incidents")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        for id in ["session-a", "session-b"] {
+            db.insert_session(&Session {
+                id: id.to_string(),
+                task: id.to_string(),
+                project: "workspace".to_string(),
+                task_group: "general".to_string(),
+                agent_type: "claude".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                state: SessionState::Running,
+                pid: None,
+                worktree: None,
+                created_at: now,
+                updated_at: now,
+                last_heartbeat_at: now,
+                metrics: SessionMetrics::default(),
+            })?;
+        }
+
+        let incident = db.upsert_conflict_incident(
+            "src/lib.rs::session-a::session-b",
+            "src/lib.rs",
+            "session-a",
+            "session-b",
+            "session-a",
+            "session-b",
+            &FileActivityAction::Modify,
+            &FileActivityAction::Modify,
+            "escalate",
+            "Paused session-b after overlapping modify on src/lib.rs",
+        )?;
+        assert_eq!(incident.paused_session_id, "session-b");
+        assert!(db.has_open_conflict_incident("src/lib.rs::session-a::session-b")?);
+
+        let listed = db.list_open_conflict_incidents_for_session("session-b", 10)?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "src/lib.rs");
+
+        let resolved = db.resolve_conflict_incidents_not_in(&HashSet::new())?;
+        assert_eq!(resolved, 1);
+        assert!(!db.has_open_conflict_incident("src/lib.rs::session-a::session-b")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn open_migrates_legacy_tool_log_before_creating_hook_event_index() -> Result<()> {
+        let tempdir = TestDir::new("store-legacy-hook-event")?;
+        let db_path = tempdir.path().join("state.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                task TEXT NOT NULL,
+                agent_type TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE tool_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                input_summary TEXT,
+                output_summary TEXT,
+                duration_ms INTEGER,
+                risk_score REAL DEFAULT 0.0,
+                timestamp TEXT NOT NULL
+            );
+            ",
+        )?;
+        drop(conn);
+
+        let db = StateStore::open(&db_path)?;
+        assert!(db.has_column("tool_log", "hook_event_id")?);
+
+        let conn = Connection::open(&db_path)?;
+        let index_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_tool_log_hook_event'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(index_count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_and_list_decisions_for_session() -> Result<()> {
+        let tempdir = TestDir::new("store-decisions")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "architect".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.insert_decision(
+            "session-1",
+            "Use sqlite for the shared context graph",
+            &["json files".to_string(), "memory only".to_string()],
+            "SQLite keeps the audit trail queryable from both CLI and TUI.",
+        )?;
+        db.insert_decision(
+            "session-1",
+            "Keep decision logging append-only",
+            &["mutable edits".to_string()],
+            "Append-only history preserves operator trust and timeline integrity.",
+        )?;
+
+        let entries = db.list_decisions_for_session("session-1", 10)?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].session_id, "session-1");
+        assert_eq!(
+            entries[0].decision,
+            "Use sqlite for the shared context graph"
+        );
+        assert_eq!(
+            entries[0].alternatives,
+            vec!["json files".to_string(), "memory only".to_string()]
+        );
+        assert_eq!(entries[1].decision, "Keep decision logging append-only");
+        assert_eq!(
+            entries[1].reasoning,
+            "Append-only history preserves operator trust and timeline integrity."
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_recent_decisions_across_sessions_returns_latest_subset_in_order() -> Result<()> {
+        let tempdir = TestDir::new("store-decisions-all")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        for session_id in ["session-a", "session-b", "session-c"] {
+            db.insert_session(&Session {
+                id: session_id.to_string(),
+                task: "decision log".to_string(),
+                project: "workspace".to_string(),
+                task_group: "general".to_string(),
+                agent_type: "claude".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                state: SessionState::Running,
+                pid: None,
+                worktree: None,
+                created_at: now,
+                updated_at: now,
+                last_heartbeat_at: now,
+                metrics: SessionMetrics::default(),
+            })?;
+        }
+
+        db.insert_decision("session-a", "Oldest", &[], "first")?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        db.insert_decision("session-b", "Middle", &[], "second")?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        db.insert_decision("session-c", "Newest", &[], "third")?;
+
+        let entries = db.list_decisions(2)?;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.decision.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Middle", "Newest"]
+        );
+        assert_eq!(entries[0].session_id, "session-b");
+        assert_eq!(entries[1].session_id, "session-c");
+
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_and_filter_context_graph_entities() -> Result<()> {
+        let tempdir = TestDir::new("store-context-entities")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "context graph".to_string(),
+            project: "workspace".to_string(),
+            task_group: "knowledge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("language".to_string(), "rust".to_string());
+        let file = db.upsert_context_entity(
+            Some("session-1"),
+            "file",
+            "dashboard.rs",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "Primary dashboard surface",
+            &metadata,
+        )?;
+        let updated = db.upsert_context_entity(
+            Some("session-1"),
+            "file",
+            "dashboard.rs",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "Updated dashboard summary",
+            &metadata,
+        )?;
+        let decision = db.upsert_context_entity(
+            None,
+            "decision",
+            "Prefer SQLite graph storage",
+            None,
+            "Keeps graph queryable from CLI and TUI",
+            &BTreeMap::new(),
+        )?;
+
+        assert_eq!(file.id, updated.id);
+        assert_eq!(updated.summary, "Updated dashboard summary");
+
+        let session_entities = db.list_context_entities(Some("session-1"), Some("file"), 10)?;
+        assert_eq!(session_entities.len(), 1);
+        assert_eq!(session_entities[0].id, file.id);
+        assert_eq!(
+            session_entities[0].metadata.get("language"),
+            Some(&"rust".to_string())
+        );
+
+        let all_entities = db.list_context_entities(None, None, 10)?;
+        assert_eq!(all_entities.len(), 2);
+        assert!(all_entities.iter().any(|entity| entity.id == decision.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_and_list_context_observations() -> Result<()> {
+        let tempdir = TestDir::new("store-context-observations")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "deep memory".to_string(),
+            project: "workspace".to_string(),
+            task_group: "knowledge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let entity = db.upsert_context_entity(
+            Some("session-1"),
+            "decision",
+            "Prefer recovery-first routing",
+            None,
+            "Recovered installs should go through the portal first",
+            &BTreeMap::new(),
+        )?;
+        let observation = db.add_context_observation(
+            Some("session-1"),
+            entity.id,
+            "note",
+            "Customer wiped setup and got charged twice",
+            &BTreeMap::from([("customer".to_string(), "viktor".to_string())]),
+        )?;
+
+        let observations = db.list_context_observations(Some(entity.id), 10)?;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].id, observation.id);
+        assert_eq!(observations[0].entity_name, "Prefer recovery-first routing");
+        assert_eq!(observations[0].observation_type, "note");
+        assert_eq!(
+            observations[0].details.get("customer"),
+            Some(&"viktor".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn compact_context_graph_prunes_duplicate_and_overflow_observations() -> Result<()> {
+        let tempdir = TestDir::new("store-context-compaction")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "deep memory".to_string(),
+            project: "workspace".to_string(),
+            task_group: "knowledge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let entity = db.upsert_context_entity(
+            Some("session-1"),
+            "decision",
+            "Prefer recovery-first routing",
+            None,
+            "Recovered installs should go through the portal first",
+            &BTreeMap::new(),
+        )?;
+
+        for summary in [
+            "old duplicate",
+            "keep me",
+            "old duplicate",
+            "recent",
+            "latest",
+        ] {
+            db.conn.execute(
+                "INSERT INTO context_graph_observations (
+                    session_id, entity_id, observation_type, summary, details_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "session-1",
+                    entity.id,
+                    "note",
+                    summary,
+                    "{}",
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let stats = db.compact_context_graph(None, 3)?;
+        assert_eq!(stats.entities_scanned, 1);
+        assert_eq!(stats.duplicate_observations_deleted, 1);
+        assert_eq!(stats.overflow_observations_deleted, 1);
+        assert_eq!(stats.observations_retained, 3);
+
+        let observations = db.list_context_observations(Some(entity.id), 10)?;
+        let summaries = observations
+            .iter()
+            .map(|observation| observation.summary.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(summaries, vec!["latest", "recent", "old duplicate"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_context_observation_auto_compacts_entity_history() -> Result<()> {
+        let tempdir = TestDir::new("store-context-auto-compaction")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "deep memory".to_string(),
+            project: "workspace".to_string(),
+            task_group: "knowledge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let entity = db.upsert_context_entity(
+            Some("session-1"),
+            "session",
+            "session-1",
+            None,
+            "Deep-memory worker",
+            &BTreeMap::new(),
+        )?;
+
+        for index in 0..(DEFAULT_CONTEXT_GRAPH_OBSERVATION_RETENTION + 2) {
+            let summary = format!("completion summary {}", index);
+            db.add_context_observation(
+                Some("session-1"),
+                entity.id,
+                "completion_summary",
+                &summary,
+                &BTreeMap::new(),
+            )?;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let observations = db.list_context_observations(Some(entity.id), 20)?;
+        assert_eq!(
+            observations.len(),
+            DEFAULT_CONTEXT_GRAPH_OBSERVATION_RETENTION
+        );
+        assert_eq!(observations[0].summary, "completion summary 13");
+        assert_eq!(observations.last().unwrap().summary, "completion summary 2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn recall_context_entities_ranks_matching_entities() -> Result<()> {
+        let tempdir = TestDir::new("store-context-recall")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "Investigate auth callback recovery".to_string(),
+            project: "ecc-tools".to_string(),
+            task_group: "incident".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let callback = db.upsert_context_entity(
+            Some("session-1"),
+            "file",
+            "callback.ts",
+            Some("src/routes/auth/callback.ts"),
+            "Handles auth callback recovery and billing portal fallback",
+            &BTreeMap::from([("area".to_string(), "auth".to_string())]),
+        )?;
+        let recovery = db.upsert_context_entity(
+            Some("session-1"),
+            "decision",
+            "Use recovery-first callback routing",
+            None,
+            "Auth callback recovery should prefer the billing portal",
+            &BTreeMap::new(),
+        )?;
+        let unrelated = db.upsert_context_entity(
+            Some("session-1"),
+            "file",
+            "dashboard.rs",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "Renders the TUI dashboard",
+            &BTreeMap::new(),
+        )?;
+
+        db.upsert_context_relation(
+            Some("session-1"),
+            callback.id,
+            recovery.id,
+            "supports",
+            "Callback route supports recovery-first routing",
+        )?;
+        db.upsert_context_relation(
+            Some("session-1"),
+            callback.id,
+            unrelated.id,
+            "references",
+            "Callback route references the dashboard summary",
+        )?;
+        db.add_context_observation(
+            Some("session-1"),
+            recovery.id,
+            "incident_note",
+            "Previous auth callback recovery incident affected Viktor after a wipe",
+            &BTreeMap::new(),
+        )?;
+
+        let results =
+            db.recall_context_entities(Some("session-1"), "Investigate auth callback recovery", 3)?;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].entity.id, callback.id);
+        assert!(results[0].matched_terms.iter().any(|term| term == "auth"));
+        assert!(results[0]
+            .matched_terms
+            .iter()
+            .any(|term| term == "callback"));
+        assert!(results[0]
+            .matched_terms
+            .iter()
+            .any(|term| term == "recovery"));
+        assert_eq!(results[0].relation_count, 2);
+        assert_eq!(results[1].entity.id, recovery.id);
+        assert_eq!(results[1].observation_count, 1);
+        assert!(!results.iter().any(|entry| entry.entity.id == unrelated.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn context_graph_detail_includes_incoming_and_outgoing_relations() -> Result<()> {
+        let tempdir = TestDir::new("store-context-relations")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "context graph".to_string(),
+            project: "workspace".to_string(),
+            task_group: "knowledge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let file = db.upsert_context_entity(
+            Some("session-1"),
+            "file",
+            "dashboard.rs",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "",
+            &BTreeMap::new(),
+        )?;
+        let function = db.upsert_context_entity(
+            Some("session-1"),
+            "function",
+            "render_metrics",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "",
+            &BTreeMap::new(),
+        )?;
+        let decision = db.upsert_context_entity(
+            Some("session-1"),
+            "decision",
+            "Persist graph in sqlite",
+            None,
+            "",
+            &BTreeMap::new(),
+        )?;
+
+        db.upsert_context_relation(
+            Some("session-1"),
+            file.id,
+            function.id,
+            "contains",
+            "Dashboard file contains metrics rendering logic",
+        )?;
+        db.upsert_context_relation(
+            Some("session-1"),
+            decision.id,
+            function.id,
+            "drives",
+            "Storage choice drives the function implementation",
+        )?;
+
+        let detail = db
+            .get_context_entity_detail(function.id, 10)?
+            .expect("detail should exist");
+        assert_eq!(detail.entity.name, "render_metrics");
+        assert_eq!(detail.incoming.len(), 2);
+        assert!(detail.outgoing.is_empty());
+
+        let relation_types = detail
+            .incoming
+            .iter()
+            .map(|relation| relation.relation_type.as_str())
+            .collect::<Vec<_>>();
+        assert!(relation_types.contains(&"contains"));
+        assert!(relation_types.contains(&"drives"));
+
+        let filtered_relations = db.list_context_relations(Some(function.id), 10)?;
+        assert_eq!(filtered_relations.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_decision_automatically_upserts_context_graph_entity() -> Result<()> {
+        let tempdir = TestDir::new("store-context-decision-auto")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "context graph".to_string(),
+            project: "workspace".to_string(),
+            task_group: "knowledge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.insert_decision(
+            "session-1",
+            "Use sqlite for shared context",
+            &["json files".to_string(), "memory only".to_string()],
+            "SQLite keeps the graph queryable from CLI and TUI",
+        )?;
+
+        let entities = db.list_context_entities(Some("session-1"), Some("decision"), 10)?;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "Use sqlite for shared context");
+        assert_eq!(
+            entities[0].metadata.get("alternatives_count"),
+            Some(&"2".to_string())
+        );
+        assert!(entities[0]
+            .summary
+            .contains("SQLite keeps the graph queryable"));
+
+        let session_entities = db.list_context_entities(Some("session-1"), Some("session"), 10)?;
+        assert_eq!(session_entities.len(), 1);
+        assert_eq!(session_entities[0].name, "session-1");
+        assert_eq!(
+            session_entities[0].metadata.get("task"),
+            Some(&"context graph".to_string())
+        );
+
+        let relations = db.list_context_relations(Some(session_entities[0].id), 10)?;
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_type, "decided");
+        assert_eq!(relations[0].to_entity_type, "decision");
+        assert_eq!(relations[0].to_entity_name, "Use sqlite for shared context");
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_tool_activity_metrics_automatically_upserts_file_entities() -> Result<()> {
+        let tempdir = TestDir::new("store-context-file-auto")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "context graph".to_string(),
+            project: "workspace".to_string(),
+            task_group: "knowledge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let metrics_dir = tempdir.path().join(".claude/metrics");
+        std::fs::create_dir_all(&metrics_dir)?;
+        let metrics_path = metrics_dir.join("tool-usage.jsonl");
+        std::fs::write(
+            &metrics_path,
+            "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/config.ts\",\"output_summary\":\"updated config\",\"file_events\":[{\"path\":\"src/config.ts\",\"action\":\"modify\",\"diff_preview\":\"old -> new\"}],\"timestamp\":\"2026-04-10T00:00:00Z\"}\n",
+        )?;
+
+        db.sync_tool_activity_metrics(&metrics_path)?;
+
+        let entities = db.list_context_entities(Some("session-1"), Some("file"), 10)?;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "config.ts");
+        assert_eq!(entities[0].path.as_deref(), Some("src/config.ts"));
+        assert_eq!(
+            entities[0].metadata.get("last_action"),
+            Some(&"modify".to_string())
+        );
+        assert_eq!(
+            entities[0].metadata.get("last_tool"),
+            Some(&"Edit".to_string())
+        );
+        assert!(entities[0]
+            .summary
+            .contains("Last activity: modify via Edit"));
+
+        let session_entities = db.list_context_entities(Some("session-1"), Some("session"), 10)?;
+        assert_eq!(session_entities.len(), 1);
+        let relations = db.list_context_relations(Some(session_entities[0].id), 10)?;
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_type, "modify");
+        assert_eq!(relations[0].to_entity_type, "file");
+        assert_eq!(relations[0].to_entity_name, "config.ts");
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_context_graph_history_backfills_existing_activity() -> Result<()> {
+        let tempdir = TestDir::new("store-context-backfill")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "context graph".to_string(),
+            project: "workspace".to_string(),
+            task_group: "knowledge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.conn.execute(
+            "INSERT INTO decision_log (session_id, decision, alternatives_json, reasoning, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "session-1",
+                "Backfill historical decision",
+                "[]",
+                "Historical reasoning",
+                "2026-04-10T00:00:00Z",
+            ],
+        )?;
+        db.conn.execute(
+            "INSERT INTO tool_log (
+                hook_event_id, session_id, tool_name, input_summary, input_params_json, output_summary,
+                trigger_summary, duration_ms, risk_score, timestamp, file_paths_json, file_events_json
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "evt-backfill",
+                "session-1",
+                "Write",
+                "Write src/backfill.rs",
+                "{}",
+                "updated file",
+                "context graph",
+                0u64,
+                0.0f64,
+                "2026-04-10T00:01:00Z",
+                "[\"src/backfill.rs\"]",
+                "[{\"path\":\"src/backfill.rs\",\"action\":\"modify\"}]",
+            ],
+        )?;
+        db.conn.execute(
+            "INSERT INTO messages (from_session, to_session, content, msg_type, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "session-1",
+                "session-2",
+                "{\"task\":\"Review backfill output\",\"context\":\"graph sync\"}",
+                "task_handoff",
+                "2026-04-10T00:02:00Z",
+            ],
+        )?;
+
+        let stats = db.sync_context_graph_history(Some("session-1"), 10)?;
+        assert_eq!(stats.sessions_scanned, 1);
+        assert_eq!(stats.decisions_processed, 1);
+        assert_eq!(stats.file_events_processed, 1);
+        assert_eq!(stats.messages_processed, 1);
+
+        let entities = db.list_context_entities(Some("session-1"), None, 10)?;
+        assert!(entities
+            .iter()
+            .any(|entity| entity.entity_type == "decision"
+                && entity.name == "Backfill historical decision"));
+        assert!(entities.iter().any(|entity| entity.entity_type == "file"
+            && entity.path.as_deref() == Some("src/backfill.rs")));
+        let session_entity = entities
+            .iter()
+            .find(|entity| entity.entity_type == "session" && entity.name == "session-1")
+            .expect("session entity should exist");
+        let relations = db.list_context_relations(Some(session_entity.id), 10)?;
+        assert_eq!(relations.len(), 3);
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "decided"));
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "modify"));
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "delegates_to"));
+
+        Ok(())
+    }
+
+    #[test]
     fn refresh_session_durations_updates_running_and_terminal_sessions() -> Result<()> {
         let tempdir = TestDir::new("store-duration-metrics")?;
         let db = StateStore::open(&tempdir.path().join("state.db"))?;
@@ -2392,6 +4824,8 @@ mod tests {
         db.insert_session(&Session {
             id: "running-1".to_string(),
             task: "live run".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2405,6 +4839,8 @@ mod tests {
         db.insert_session(&Session {
             id: "done-1".to_string(),
             task: "finished run".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Completed,
@@ -2440,6 +4876,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "heartbeat".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2470,6 +4908,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "buffer output".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2558,6 +4998,29 @@ mod tests {
             db.unread_task_handoff_targets(10)?,
             vec![("worker-2".to_string(), 1), ("worker-3".to_string(), 1),]
         );
+
+        let planner_entities = db.list_context_entities(Some("planner"), Some("session"), 10)?;
+        assert_eq!(planner_entities.len(), 1);
+        let planner_relations = db.list_context_relations(Some(planner_entities[0].id), 10)?;
+        assert!(planner_relations.iter().any(|relation| {
+            relation.relation_type == "queries" && relation.to_entity_name == "worker"
+        }));
+        assert!(planner_relations.iter().any(|relation| {
+            relation.relation_type == "delegates_to" && relation.to_entity_name == "worker-2"
+        }));
+        assert!(planner_relations.iter().any(|relation| {
+            relation.relation_type == "delegates_to" && relation.to_entity_name == "worker-3"
+        }));
+
+        let worker_entity = db
+            .list_context_entities(Some("worker"), Some("session"), 10)?
+            .into_iter()
+            .find(|entity| entity.name == "worker")
+            .expect("worker session entity should exist");
+        let worker_relations = db.list_context_relations(Some(worker_entity.id), 10)?;
+        assert!(worker_relations.iter().any(|relation| {
+            relation.relation_type == "completed_for" && relation.to_entity_name == "planner"
+        }));
 
         Ok(())
     }
