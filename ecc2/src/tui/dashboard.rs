@@ -23,7 +23,8 @@ use crate::session::output::{
 };
 use crate::session::store::{DaemonActivity, FileActivityOverlap, StateStore};
 use crate::session::{
-    DecisionLogEntry, FileActivityEntry, Session, SessionGrouping, SessionMessage, SessionState,
+    ContextObservationPriority, DecisionLogEntry, FileActivityEntry, Session, SessionGrouping,
+    SessionHarnessInfo, SessionMessage, SessionState,
 };
 use crate::worktree;
 
@@ -86,6 +87,7 @@ pub struct Dashboard {
     notifier: DesktopNotifier,
     webhook_notifier: WebhookNotifier,
     sessions: Vec<Session>,
+    session_harnesses: HashMap<String, SessionHarnessInfo>,
     session_output_cache: HashMap<String, Vec<OutputLine>>,
     unread_message_counts: HashMap<String, usize>,
     approval_queue_counts: HashMap<String, usize>,
@@ -474,6 +476,29 @@ impl SessionCompletionSummary {
     }
 }
 
+fn load_session_harnesses(
+    db: &StateStore,
+    cfg: &Config,
+    sessions: &[Session],
+) -> HashMap<String, SessionHarnessInfo> {
+    let working_dirs = sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session.working_dir.as_path()))
+        .collect::<HashMap<_, _>>();
+    db.list_session_harnesses()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(session_id, info)| {
+            let info = if let Some(working_dir) = working_dirs.get(session_id.as_str()) {
+                info.with_config_detection(cfg, working_dir)
+            } else {
+                info
+            };
+            (session_id, info)
+        })
+        .collect()
+}
+
 impl Dashboard {
     pub fn new(db: StateStore, cfg: Config) -> Self {
         Self::with_output_store(db, cfg, SessionOutputStore::default())
@@ -496,6 +521,7 @@ impl Dashboard {
             let _ = db.sync_tool_activity_metrics(&cfg.tool_activity_metrics_path());
         }
         let sessions = db.list_sessions().unwrap_or_default();
+        let session_harnesses = load_session_harnesses(&db, &cfg, &sessions);
         let initial_session_states = sessions
             .iter()
             .map(|session| (session.id.clone(), session.state.clone()))
@@ -521,6 +547,7 @@ impl Dashboard {
             notifier,
             webhook_notifier,
             sessions,
+            session_harnesses,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
             approval_queue_counts: HashMap::new(),
@@ -2170,6 +2197,7 @@ impl Dashboard {
                 &comms::MessageType::TaskHandoff {
                     task: source_session.task.clone(),
                     context,
+                    priority: comms::TaskPriority::Normal,
                 },
             ) {
                 tracing::warn!(
@@ -3651,6 +3679,7 @@ impl Dashboard {
                             &comms::MessageType::TaskHandoff {
                                 task: task.clone(),
                                 context: context.clone(),
+                                priority: comms::TaskPriority::Normal,
                             },
                         ) {
                             tracing::warn!(
@@ -4034,6 +4063,7 @@ impl Dashboard {
                 Vec::new()
             }
         };
+        self.session_harnesses = load_session_harnesses(&self.db, &self.cfg, &self.sessions);
         self.unread_message_counts = match self.db.unread_message_counts() {
             Ok(counts) => counts,
             Err(error) => {
@@ -4251,9 +4281,16 @@ impl Dashboard {
             summary.warnings.len()
         );
         let details = completion_summary_observation_details(summary, session);
+        let priority = if observation_type == "failure_summary" {
+            ContextObservationPriority::High
+        } else {
+            ContextObservationPriority::Normal
+        };
         if let Err(error) = self.db.add_session_observation(
             &session.id,
             observation_type,
+            priority,
+            false,
             &observation_summary,
             &details,
         ) {
@@ -5358,14 +5395,18 @@ impl Dashboard {
         let mut lines = vec!["Relevant memory".to_string()];
         for entry in entries {
             let mut line = format!(
-                "- #{} [{}] {} | score {} | relations {} | observations {}",
+                "- #{} [{}] {} | score {} | relations {} | observations {} | priority {}",
                 entry.entity.id,
                 entry.entity.entity_type,
                 truncate_for_dashboard(&entry.entity.name, 60),
                 entry.score,
                 entry.relation_count,
-                entry.observation_count
+                entry.observation_count,
+                entry.max_observation_priority
             );
+            if entry.has_pinned_observation {
+                line.push_str(" | pinned");
+            }
             if let Some(session_id) = entry.entity.session_id.as_deref() {
                 if session_id != session.id {
                     line.push_str(&format!(" | {}", format_session_id(session_id)));
@@ -5387,7 +5428,9 @@ impl Dashboard {
             if let Ok(observations) = self.db.list_context_observations(Some(entry.entity.id), 1) {
                 if let Some(observation) = observations.first() {
                     lines.push(format!(
-                        "  memory {}",
+                        "  memory [{}{}] {}",
+                        observation.priority,
+                        if observation.pinned { "/pinned" } else { "" },
                         truncate_for_dashboard(&observation.summary, 72)
                     ));
                 }
@@ -6316,6 +6359,14 @@ impl Dashboard {
                         }
                     }
                 }
+            }
+
+            if let Some(harness) = self.session_harnesses.get(&session.id) {
+                lines.push(format!(
+                    "Harness {} | Detected {}",
+                    harness.primary_label,
+                    harness.detected_summary()
+                ));
             }
 
             lines.push(format!(
@@ -10534,6 +10585,8 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
             Some(&memory.id),
             entity.id,
             "completion_summary",
+            ContextObservationPriority::Normal,
+            true,
             "Recovered auth callback incident with billing fallback",
             &BTreeMap::new(),
         )?;
@@ -10541,8 +10594,11 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
         let text = dashboard.selected_session_metrics_text();
         assert!(text.contains("Relevant memory"));
         assert!(text.contains("[file] callback.ts"));
+        assert!(text.contains("| pinned"));
         assert!(text.contains("matches auth, callback, recovery"));
-        assert!(text.contains("memory Recovered auth callback incident with billing fallback"));
+        assert!(text.contains(
+            "memory [normal/pinned] Recovered auth callback incident with billing fallback"
+        ));
         Ok(())
     }
 
@@ -12257,6 +12313,40 @@ diff --git a/src/lib.rs b/src/lib.rs
                 .len(),
             1
         );
+
+        let _ = fs::remove_dir_all(tempdir);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_harness_summary() -> Result<()> {
+        let tempdir = std::env::temp_dir().join(format!(
+            "ecc2-dashboard-harness-metrics-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(tempdir.join(".claude"))?;
+        fs::create_dir_all(tempdir.join(".codex"))?;
+
+        let now = Utc::now();
+        let session = Session {
+            id: "sess-harness".to_string(),
+            task: "Map harness metadata".to_string(),
+            project: "ecc".to_string(),
+            task_group: "compat".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: tempdir.clone(),
+            state: SessionState::Running,
+            pid: Some(4242),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        };
+
+        let dashboard = test_dashboard(vec![session], 0);
+        let metrics_text = dashboard.selected_session_metrics_text();
+        assert!(metrics_text.contains("Harness claude | Detected claude, codex"));
 
         let _ = fs::remove_dir_all(tempdir);
         Ok(())
@@ -14410,6 +14500,16 @@ diff --git a/src/lib.rs b/src/lib.rs
             .iter()
             .map(|session| (session.id.clone(), session.state.clone()))
             .collect();
+        let session_harnesses = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    SessionHarnessInfo::detect(&session.agent_type, &session.working_dir)
+                        .with_config_detection(&cfg, &session.working_dir),
+                )
+            })
+            .collect();
         let output_store = SessionOutputStore::default();
         let output_rx = output_store.subscribe();
         let mut session_table_state = TableState::default();
@@ -14426,6 +14526,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             notifier,
             webhook_notifier,
             sessions,
+            session_harnesses,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
             approval_queue_counts: HashMap::new(),
@@ -14507,9 +14608,11 @@ diff --git a/src/lib.rs b/src/lib.rs
             auto_terminate_stale_sessions: false,
             default_agent: "claude".to_string(),
             default_agent_profile: None,
+            harness_runners: Default::default(),
             agent_profiles: Default::default(),
             orchestration_templates: Default::default(),
             memory_connectors: Default::default(),
+            computer_use_dispatch: crate::config::ComputerUseDispatchConfig::default(),
             auto_dispatch_unread_handoffs: false,
             auto_dispatch_limit_per_session: 5,
             auto_create_worktrees: true,
