@@ -191,6 +191,30 @@ function runTests() {
     assert.ok(output.hookSpecificOutput.permissionDecisionReason.includes('call this new file'));
   })) passed++; else failed++;
 
+  // --- Test 3b: fails open when retry state cannot be persisted ---
+  clearState();
+  if (test('fails open with warning when state path cannot be persisted', () => {
+    const invalidStateDir = path.join(stateDir, 'not-a-directory');
+    fs.writeFileSync(invalidStateDir, 'not a directory', 'utf8');
+
+    const input = {
+      tool_name: 'Write',
+      tool_input: { file_path: '/src/state-failure.js', content: 'module.exports = {};' }
+    };
+    const result = runHook(input, { GATEGUARD_STATE_DIR: invalidStateDir });
+    assert.strictEqual(result.code, 0, 'exit code should be 0');
+    const output = parseOutput(result.stdout);
+    assert.ok(output, 'should produce valid JSON output');
+    if (output.hookSpecificOutput) {
+      assert.notStrictEqual(output.hookSpecificOutput.permissionDecision, 'deny',
+        'unpersistable state must not deny a retry that can never be recorded');
+    } else {
+      assert.strictEqual(output.tool_name, 'Write', 'pass-through should preserve input');
+    }
+    assert.ok(result.stderr.includes('GateGuard state could not be persisted'),
+      'should warn that state persistence failed');
+  })) passed++; else failed++;
+
   // --- Test 4: denies destructive Bash, allows retry ---
   clearState();
   if (test('denies destructive Bash commands, allows retry after facts presented', () => {
@@ -222,6 +246,62 @@ function runTests() {
   })) passed++; else failed++;
 
   // --- Test 5: denies first routine Bash, allows second ---
+  clearState();
+  if (test('allows safe git push --force-with-lease without destructive gate', () => {
+    writeState({
+      checked: ['__bash_session__'],
+      last_active: Date.now()
+    });
+
+    const input = {
+      tool_name: 'Bash',
+      tool_input: { command: 'git push --force-with-lease origin feature-branch' }
+    };
+    const result = runBashHook(input);
+    assert.strictEqual(result.code, 0, 'exit code should be 0');
+    const output = parseOutput(result.stdout);
+    assert.ok(output, 'should produce valid JSON output');
+    if (output.hookSpecificOutput) {
+      assert.notStrictEqual(output.hookSpecificOutput.permissionDecision, 'deny',
+        'safe lease-protected force push should not be denied');
+    } else {
+      assert.strictEqual(output.tool_name, 'Bash', 'pass-through should preserve input');
+    }
+  })) passed++; else failed++;
+
+  // --- Test 6: gates amend as destructive Bash ---
+  clearState();
+  if (test('denies git commit --amend as destructive Bash', () => {
+    const input = {
+      tool_name: 'Bash',
+      tool_input: { command: 'git commit --amend --no-edit' }
+    };
+    const result = runBashHook(input);
+    assert.strictEqual(result.code, 0, 'exit code should be 0');
+    const output = parseOutput(result.stdout);
+    assert.ok(output, 'should produce JSON output');
+    assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny');
+    assert.ok(output.hookSpecificOutput.permissionDecisionReason.includes('Destructive'));
+    assert.ok(output.hookSpecificOutput.permissionDecisionReason.includes('rollback'));
+  })) passed++; else failed++;
+
+  // --- Test 7: still gates plain force push as destructive Bash ---
+  clearState();
+  if (test('denies plain git push --force as destructive Bash', () => {
+    const input = {
+      tool_name: 'Bash',
+      tool_input: { command: 'git push --force origin feature-branch' }
+    };
+    const result = runBashHook(input);
+    assert.strictEqual(result.code, 0, 'exit code should be 0');
+    const output = parseOutput(result.stdout);
+    assert.ok(output, 'should produce JSON output');
+    assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny');
+    assert.ok(output.hookSpecificOutput.permissionDecisionReason.includes('Destructive'));
+    assert.ok(output.hookSpecificOutput.permissionDecisionReason.includes('rollback'));
+  })) passed++; else failed++;
+
+  // --- Test 8: denies first routine Bash, allows second ---
   clearState();
   if (test('denies first routine Bash, allows second', () => {
     const input = {
